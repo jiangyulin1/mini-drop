@@ -1,0 +1,29 @@
+[project]
+name = "mini-drop"
+version = "0.1.0"
+description = "Mini-Drop: a lightweight Linux performance profiling platform"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi",
+    "uvicorn",
+    "pydantic",
+    "grpcio>=1.48",
+    "grpcio-tools>=1.48",
+    "protobuf>=3.20",
+    "requests",
+    "pytest",
+    "httpx",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest-cov",
+    "loguru",
+]
+
+[tool.setuptools.packages.find]
+include = ["server*", "agent*", "analyzer*"]
+exclude = ["web*", "demo*", "deploy*", "docs*", "tests*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

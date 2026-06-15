@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environment
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node
+node_modules/
+web/dist/
+web/.vite/
+
+# Project artifacts
+artifacts/
+tmp/
+logs/
+*.log
+
+# Collected data (large binary files)
+perf.data
+perf.data.*
+*.hprof
+
+# Secrets
+*.pem
+*.key
