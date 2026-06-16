@@ -1,20 +1,36 @@
-"""Pydantic 数据模型：HTTP API 的请求/响应结构。
+"""Pydantic 数据模型：HTTP API 的请求与响应结构。
 
-gRPC 服务自身使用 protobuf 消息，此处的模型用于 FastAPI 层和 Repository。
+gRPC 服务使用 protobuf 消息，此处模型专用于 FastAPI 层。
 """
 
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
+
+from server.app.state_machine import TaskStatus
 
 CollectorType = Literal["perf_cpu", "ebpf_io", "pyspy", "continuous_perf"]
 
 
+# ── 通用 ──────────────────────────────────────────────────────
+
+
+class APIResponse(BaseModel):
+    """所有 HTTP 端点的统一返回结构。"""
+
+    code: int = 0
+    message: str = "ok"
+    data: Any = None
+
+
+# ── Agent ─────────────────────────────────────────────────────
+
+
 class AgentRegistration(BaseModel):
-    """Agent 注册请求（gRPC InitAgent.RegisterAgent 的同构 HTTP 版本）。"""
+    """Agent 注册请求（与 gRPC RegisterAgentRequest 字段对齐）。"""
 
     agent_id: str
     hostname: str
@@ -25,13 +41,16 @@ class AgentRegistration(BaseModel):
 
 
 class AgentMetrics(BaseModel):
-    """Agent 自身上报的资源指标。"""
+    """Agent 每次心跳上报的自身资源指标。"""
 
     cpu_percent: float = 0.0
     rss_mb: float = 0.0
     read_kb_s: float = 0.0
     write_kb_s: float = 0.0
     children_count: int = 0
+
+
+# ── 任务 ──────────────────────────────────────────────────────
 
 
 class CreateTaskRequest(BaseModel):
@@ -44,3 +63,47 @@ class CreateTaskRequest(BaseModel):
     sample_rate: int = 99
     duration_sec: int = 15
     options: dict[str, Any] = Field(default_factory=dict)
+
+
+class TaskView(BaseModel):
+    """返回给前端的任务摘要。"""
+
+    id: str
+    name: str
+    agent_id: str
+    target_pid: int
+    collector_type: str
+    sample_rate: int
+    duration_sec: int
+    status: str  # TaskStatus.value
+    status_reason: str
+    request_params: dict[str, Any]
+    created_at: datetime
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+
+
+class AgentView(BaseModel):
+    """返回给前端的 Agent 摘要。"""
+
+    id: str
+    hostname: str
+    ip_addr: str
+    version: str
+    os_info: str
+    capabilities: list[str]
+    status: str
+    last_heartbeat_at: datetime
+    created_at: datetime
+    updated_at: datetime
+
+
+class AuditLogView(BaseModel):
+    """返回给前端的审计事件。"""
+
+    event_type: str
+    message: str
+    agent_id: Optional[str] = None
+    task_id: Optional[str] = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=lambda: datetime.utcnow())
