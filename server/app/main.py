@@ -2,7 +2,7 @@
 Mini-Drop HTTP API 入口。
 
 启动 FastAPI 服务（端口 8191），同时在后台线程运行 gRPC server（端口 50051）。
-两者共享同一个 InMemoryRepository 实例——Agent 通过 gRPC 上报的数据，
+两者共享同一个 SqlRepository 实例——Agent 通过 gRPC 上报的数据，
 Web 通过 HTTP API 即时可见。
 """
 
@@ -12,20 +12,26 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 
+from server.app.database import init_db
 from server.app.grpc_server import serve_in_background
-from server.app.repository import InMemoryRepository
 from server.app.schemas import (
     APIResponse,
     CreateTaskRequest,
     TaskView,
 )
+from server.app.sql_repository import SqlRepository
 
-repo = InMemoryRepository()
+repo = SqlRepository()
+
+
+def _status_value(status) -> str:
+    return status.value if hasattr(status, "value") else str(status)
 
 
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
     """应用生命周期：启动时拉起 gRPC，关闭时停止。"""
+    init_db()
     _grpc = serve_in_background(repo)
     yield
     _grpc.stop(grace=None).wait(timeout=5)
@@ -44,7 +50,7 @@ def _task_view(record) -> TaskView:
         collector_type=record.collector_type,
         sample_rate=record.sample_rate,
         duration_sec=record.duration_sec,
-        status=record.status.value,
+        status=_status_value(record.status),
         status_reason=record.status_reason,
         request_params=record.request_params,
         created_at=record.created_at,
@@ -96,8 +102,11 @@ def create_task(payload: CreateTaskRequest) -> APIResponse:
         raise HTTPException(status_code=400, detail="duration_sec 必须为正整数")
     if payload.sample_rate <= 0:
         raise HTTPException(status_code=400, detail="sample_rate 必须为正整数")
-    task = repo.create_task(payload)
-    return APIResponse(data={"task_id": task.id, "status": task.status.value})
+    try:
+        task = repo.create_task(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return APIResponse(data={"task_id": task.id, "status": _status_value(task.status)})
 
 
 @app.get("/api/tasks")

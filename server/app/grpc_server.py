@@ -2,13 +2,13 @@
 
 在后台线程中运行 gRPC server（端口 50051），
 与 FastAPI HTTP server（端口 8191）共存于同一进程。
-两者共享同一个 InMemoryRepository 实例。
+两者共享同一个 Repository 实例。
 """
 
 from __future__ import annotations
 
-import threading
 from concurrent import futures
+from typing import Any
 
 import grpc
 
@@ -22,10 +22,9 @@ from server.app.grpc_services.control_service import ControlService
 from server.app.grpc_services.healthcheck_service import HealthCheckService
 from server.app.grpc_services.hotmethod_service import HotmethodService
 from server.app.grpc_services.init_service import InitAgentService
-from server.app.repository import InMemoryRepository
 
 
-def serve(repo: InMemoryRepository, port: int = 50051) -> grpc.Server:
+def serve(repo: Any, port: int = 50051) -> grpc.Server:
     """创建并启动 gRPC server。
 
     Returns:
@@ -44,7 +43,7 @@ def serve(repo: InMemoryRepository, port: int = 50051) -> grpc.Server:
     return server
 
 
-def serve_in_background(repo: InMemoryRepository, port: int = 50051) -> grpc.Server:
+def serve_in_background(repo: Any, port: int = 50051) -> grpc.Server:
     """在后台守护线程启动 gRPC server，主线程继续执行 HTTP server。"""
 
     grpc_server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))

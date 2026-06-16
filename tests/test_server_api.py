@@ -11,20 +11,27 @@
 import pytest
 from fastapi.testclient import TestClient
 
+from server.app.database import init_db, reset_engine
 from server.app.main import app, repo
+from server.app.models import Base
 from server.app.state_machine import Actor, TaskStatus
 
 
 @pytest.fixture(autouse=True)
-def _reset_repo():
-    """每个测试前清空 repo，确保用例间无状态交叉。"""
-    repo.agents.clear()
-    repo.tasks.clear()
-    repo.events.clear()
-    repo.audit_logs.clear()
-    repo.artifacts.clear()
-    # 直接重置内部队列字典
+def _reset_repo(monkeypatch):
+    """每个测试使用独立 SQLite 内存库，确保用例间无状态交叉。"""
+    monkeypatch.setenv("DATABASE_URL", "sqlite:///:memory:")
+    reset_engine()
+    init_db()
     repo._task_queues.clear()
+    repo.register_agent("agent_local_demo", "demo-host", "10.0.0.10")
+    repo.register_agent("a1", "agent-one", "10.0.0.11")
+    repo.register_agent("a2", "agent-two", "10.0.0.12")
+    repo.register_agent("a3", "agent-three", "10.0.0.13")
+    yield
+    from server.app.database import _get_engine
+    Base.metadata.drop_all(bind=_get_engine())
+    reset_engine()
 
 
 @pytest.fixture(name="client")
@@ -104,6 +111,13 @@ class TestCreateTask:
             "sample_rate": -1,
         })
         assert resp.status_code == 400
+
+    def test_rejects_unknown_agent(self, client: TestClient):
+        resp = client.post("/api/tasks", json={
+            "name": "bad-agent", "agent_id": "missing_agent",
+            "target_pid": 1, "collector_type": "perf_cpu",
+        })
+        assert resp.status_code == 404
 
 
 class TestTaskListAndDetail:

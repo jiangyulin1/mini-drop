@@ -1,13 +1,14 @@
 """HealthCheck gRPC 服务：1 Hz 心跳 + 任务下发。"""
 
+from typing import Any
+
 from server.app.generated import healthcheck_pb2, healthcheck_pb2_grpc, hotmethod_pb2
-from server.app.repository import InMemoryRepository
 
 
 class HealthCheckService(healthcheck_pb2_grpc.HealthCheckServicer):
     """Agent 心跳服务，一次 RPC 同时完成保活和任务拉取。"""
 
-    def __init__(self, repo: InMemoryRepository) -> None:
+    def __init__(self, repo: Any) -> None:
         self._repo = repo
 
     def Do(self, request: healthcheck_pb2.HealthCheckRequest, context) -> healthcheck_pb2.HealthCheckResponse:

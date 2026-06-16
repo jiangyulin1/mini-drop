@@ -1,13 +1,14 @@
 """InitAgent gRPC 服务：Agent 注册与配置拉取。"""
 
+from typing import Any
+
 from server.app.generated import init_pb2, init_pb2_grpc
-from server.app.repository import InMemoryRepository
 
 
 class InitAgentService(init_pb2_grpc.InitAgentServicer):
     """Agent 启动时调用的初始化服务。"""
 
-    def __init__(self, repo: InMemoryRepository) -> None:
+    def __init__(self, repo: Any) -> None:
         self._repo = repo
 
     def RegisterAgent(self, request: init_pb2.RegisterAgentRequest, context) -> init_pb2.RegisterAgentResponse:

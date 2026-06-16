@@ -1,0 +1,226 @@
+"""SQLAlchemy Repository 测试。
+
+使用 SQLite :memory: 后端，验证与 InMemoryRepository 的接口一致性。
+"""
+
+from datetime import timedelta
+
+import pytest
+
+from server.app.database import init_db, reset_engine
+from server.app.schemas import CreateTaskRequest
+from server.app.sql_repository import SqlRepository
+from server.app.state_machine import Actor, TaskStatus, now_utc
+
+
+@pytest.fixture(autouse=True)
+def _patch_db_url(monkeypatch):
+    """测试统一使用 SQLite :memory:。"""
+    monkeypatch.setenv("DATABASE_URL", "sqlite:///:memory:")
+    reset_engine()
+    init_db()
+    yield
+    from server.app.models import Base
+    from server.app.database import _get_engine
+    Base.metadata.drop_all(bind=_get_engine())
+    reset_engine()
+
+
+@pytest.fixture(name="repo")
+def repo_fixture() -> SqlRepository:
+    """每次测试用全新的 repo + 空库。"""
+    return SqlRepository()
+
+
+class TestAgentPersistence:
+    """Agent 注册与心跳持久化。"""
+
+    AGENT_ID = "agent_pg_01"
+    IP = "10.0.1.1"
+
+    def test_register_agent_persists(self, repo: SqlRepository):
+        repo.register_agent(self.AGENT_ID, "pg-host", self.IP)
+        agents = repo.agents
+        assert self.AGENT_ID in agents
+        assert agents[self.AGENT_ID].status == "ONLINE"
+
+    def test_registered_agent_survives_repo_reload(self, repo: SqlRepository):
+        """新 repo 实例能从 DB 读到上一个实例写入的数据。"""
+        repo.register_agent(self.AGENT_ID, "pg-host", self.IP)
+
+        # 新 repo 实例（模拟重启）
+        repo2 = SqlRepository()
+        agents = repo2.agents
+        assert self.AGENT_ID in agents
+        assert agents[self.AGENT_ID].hostname == "pg-host"
+
+    def test_offline_recovery_writes_audit(self, repo: SqlRepository):
+        repo.register_agent(self.AGENT_ID, "h", self.IP)
+        # 手动标记离线
+        from server.app.database import new_session
+        from server.app.models import AgentModel
+        session = new_session()
+        agent = session.get(AgentModel, self.AGENT_ID)
+        if agent:
+            agent.status = "OFFLINE"
+            session.commit()
+        session.close()
+
+        # 重新注册
+        repo.register_agent(self.AGENT_ID, "h", self.IP)
+        logs = repo.audit_logs
+        online_logs = [l for l in logs if l.event_type == "AGENT_ONLINE"]
+        assert len(online_logs) == 1
+
+    def test_heartbeat_updates_timestamp(self, repo: SqlRepository):
+        repo.register_agent(self.AGENT_ID, "h", self.IP)
+        agent = repo.agents[self.AGENT_ID]
+        before = agent.last_heartbeat_at
+
+        import time
+        time.sleep(0.01)
+        repo.heartbeat(self.AGENT_ID, self.IP)
+
+        agent2 = repo.agents[self.AGENT_ID]
+        assert agent2.last_heartbeat_at > before
+
+    def test_mark_offline_after_timeout(self, repo: SqlRepository):
+        repo.register_agent("off_agent", "off-host", "10.0.99.1")
+        # 将心跳时间改到 31 秒前
+        from server.app.database import new_session
+        from server.app.models import AgentModel
+        session = new_session()
+        agent = session.get(AgentModel, "off_agent")
+        agent.last_heartbeat_at = now_utc() - timedelta(seconds=31)
+        session.commit()
+        session.close()
+
+        changed = repo.mark_offline_agents(timeout_sec=30)
+        assert len(changed) == 1
+        assert changed[0].status == "OFFLINE"
+
+        audit = repo.audit_logs
+        offline_logs = [l for l in audit if l.event_type == "AGENT_OFFLINE"]
+        assert len(offline_logs) == 1
+
+    def test_find_agent_by_ip(self, repo: SqlRepository):
+        repo.register_agent("ip_agent", "ip-host", "10.0.5.5")
+        found = repo.find_agent_by_ip("10.0.5.5")
+        assert found is not None
+        assert found.id == "ip_agent"
+
+
+class TestTaskPersistence:
+    """任务 CRUD 与状态迁移持久化。"""
+
+    AGENT_ID = "agent_task"
+    IP = "10.0.2.1"
+
+    def test_create_task_persists(self, repo: SqlRepository):
+        repo.register_agent(self.AGENT_ID, "h", self.IP)
+        task = repo.create_task(CreateTaskRequest(
+            name="pg-task", agent_id=self.AGENT_ID,
+            target_pid=100, collector_type="perf_cpu",
+        ))
+        assert task.status == TaskStatus.PENDING.value
+        assert task.id
+
+    def test_create_task_requires_registered_agent(self, repo: SqlRepository):
+        with pytest.raises(ValueError, match="Agent missing_agent 不存在"):
+            repo.create_task(CreateTaskRequest(
+                name="missing-agent", agent_id="missing_agent",
+                target_pid=100, collector_type="perf_cpu",
+            ))
+
+    def test_task_survives_repo_reload(self, repo: SqlRepository):
+        repo.register_agent(self.AGENT_ID, "h", self.IP)
+        task = repo.create_task(CreateTaskRequest(
+            name="survive", agent_id=self.AGENT_ID,
+            target_pid=200, collector_type="perf_cpu",
+        ))
+        task_id = task.id
+
+        repo2 = SqlRepository()
+        tasks = repo2.tasks
+        assert task_id in tasks
+
+    def test_transition_task_persists_event(self, repo: SqlRepository):
+        repo.register_agent(self.AGENT_ID, "h", self.IP)
+        task = repo.create_task(CreateTaskRequest(
+            name="event-test", agent_id=self.AGENT_ID,
+            target_pid=300, collector_type="perf_cpu",
+        ))
+
+        repo.transition_task(task.id, TaskStatus.RUNNING, "心跳拉取", Actor.SERVER)
+        events = repo.events
+        assert len(events) == 2  # PENDING + RUNNING
+
+    def test_transition_rejects_illegal_status(self, repo: SqlRepository):
+        repo.register_agent(self.AGENT_ID, "h", self.IP)
+        task = repo.create_task(CreateTaskRequest(
+            name="bad-transition", agent_id=self.AGENT_ID,
+            target_pid=1, collector_type="perf_cpu",
+        ))
+        with pytest.raises(ValueError, match="非法的状态迁移"):
+            repo.transition_task(task.id, TaskStatus.DONE, "直接跳过", Actor.SERVER)
+
+    def test_heartbeat_returns_pending_task(self, repo: SqlRepository):
+        repo.register_agent(self.AGENT_ID, "h", self.IP)
+        task = repo.create_task(CreateTaskRequest(
+            name="heartbeat-test", agent_id=self.AGENT_ID,
+            target_pid=400, collector_type="perf_cpu",
+        ))
+
+        pulled = repo.heartbeat(self.AGENT_ID, self.IP)
+        assert pulled is not None
+        assert pulled.id == task.id
+        assert pulled.status == TaskStatus.RUNNING.value
+
+
+class TestArtifactPersistence:
+    """产物存储持久化。"""
+
+    AGENT_ID = "agent_art"
+    IP = "10.0.3.1"
+
+    def test_add_and_query_artifacts(self, repo: SqlRepository):
+        repo.register_agent(self.AGENT_ID, "h", self.IP)
+        task = repo.create_task(CreateTaskRequest(
+            name="art-pg", agent_id=self.AGENT_ID,
+            target_pid=1, collector_type="perf_cpu",
+        ))
+        repo.add_artifacts(task.id, [
+            {"artifact_type": "raw", "bucket": "mini-drop",
+             "object_key": "tasks/x/perf.data"}
+        ])
+        arts = repo.artifacts.get(task.id, [])
+        assert len(arts) == 1
+        assert arts[0]["artifact_type"] == "raw"
+
+    def test_artifacts_survive_repo_reload(self, repo: SqlRepository):
+        repo.register_agent(self.AGENT_ID, "h", self.IP)
+        task = repo.create_task(CreateTaskRequest(
+            name="art-survive", agent_id=self.AGENT_ID,
+            target_pid=1, collector_type="perf_cpu",
+        ))
+        repo.add_artifacts(task.id, [{"artifact_type": "raw", "bucket": "m", "object_key": "k"}])
+
+        repo2 = SqlRepository()
+        arts = repo2.artifacts.get(task.id, [])
+        assert len(arts) == 1
+
+
+class TestAuditPersistence:
+    """审计日志持久化。"""
+
+    def test_audit_logs_survive_repo_reload(self, repo: SqlRepository):
+        repo.register_agent("audit_agent", "h", "10.0.4.1")
+        repo.create_task(CreateTaskRequest(
+            name="audit-task", agent_id="audit_agent",
+            target_pid=1, collector_type="perf_cpu",
+        ))
+
+        repo2 = SqlRepository()
+        logs = repo2.audit_logs
+        assert len(logs) >= 1
+        assert any(l.event_type == "TASK_CREATED" for l in logs)

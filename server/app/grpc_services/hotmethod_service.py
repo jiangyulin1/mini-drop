@@ -1,18 +1,18 @@
 """Hotmethod gRPC 服务：接收 Agent 采集结果。"""
 
 import json
+from typing import Any
 
 from google.protobuf.empty_pb2 import Empty
 
 from server.app.generated import hotmethod_pb2_grpc
-from server.app.repository import InMemoryRepository
 from server.app.state_machine import Actor, TaskStatus
 
 
 class HotmethodService(hotmethod_pb2_grpc.HotmethodServicer):
     """采集结果上报服务。"""
 
-    def __init__(self, repo: InMemoryRepository) -> None:
+    def __init__(self, repo: Any) -> None:
         self._repo = repo
 
     def NotifyResult(self, request, context) -> Empty:

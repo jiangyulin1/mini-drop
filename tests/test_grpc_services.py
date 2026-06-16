@@ -242,6 +242,18 @@ class TestControlService:
         assert pull_resp.pending is True
         assert pull_resp.task_desc.task_id == resp.task_id
 
+    def test_create_task_rejects_unknown_target_ip(self, grpc_fix: GrpcFixture):
+        with pytest.raises(grpc.RpcError) as exc_info:
+            grpc_fix.control_stub.CreateTask(
+                control_pb2.CreateTaskRequest(
+                    target_ip="10.0.0.250",
+                    task_desc=hotmethod_pb2.TaskDesc(
+                        sample_argv=hotmethod_pb2.RecordArgv(hz=99, duration=15, pid=1234),
+                    ),
+                )
+            )
+        assert exc_info.value.code() == grpc.StatusCode.NOT_FOUND
+
     def test_stat_agent_online(self, grpc_fix: GrpcFixture):
         grpc_fix.init_stub.RegisterAgent(
             init_pb2.RegisterAgentRequest(
