@@ -1,0 +1,158 @@
+"""perf 采集器单元测试。
+
+在非 Linux 环境下，真实的 perf record 无法执行。
+测试通过 mock subprocess.Popen 覆盖各执行分支。
+"""
+
+import subprocess
+from unittest import mock
+
+import pytest
+
+from agent.mini_drop_agent.collectors.base import CollectorResult, CollectorTask
+from agent.mini_drop_agent.collectors.perf import PerfCollector
+
+
+@pytest.fixture(name="collector")
+def collector_fixture() -> PerfCollector:
+    return PerfCollector()
+
+
+@pytest.fixture(name="task")
+def task_fixture() -> CollectorTask:
+    return CollectorTask(
+        id="task_test_001",
+        collector_type="perf_cpu",
+        target_pid=1234,
+        sample_rate=99,
+        duration_sec=10,
+        options={"callgraph": "fp", "event": "cpu-cycles"},
+    )
+
+
+def _mock_popen_complete(returncode=0, stdout=b"", stderr=b"", *, pid=9999, side_effect=None):
+    """构造一个模拟的 Popen 实例。"""
+    p = mock.MagicMock()
+    p.returncode = returncode
+    p.pid = pid
+    if side_effect:
+        p.communicate.side_effect = side_effect
+    else:
+        p.communicate.return_value = (stdout, stderr)
+    return p
+
+
+class TestPerfAvailabilityChecks:
+    """perf 命令可用性和权限检查。"""
+
+    def test_perf_not_installed_returns_failure(self, collector: PerfCollector, task: CollectorTask):
+        with mock.patch("shutil.which", return_value=None):
+            result = collector.collect(task)
+        assert result.ok is False
+        assert "perf 命令不可用" in result.reason
+
+    def test_paranoid_too_high_returns_failure(self, collector: PerfCollector, task: CollectorTask):
+        with mock.patch("shutil.which", return_value="/usr/bin/perf"), \
+             mock.patch.object(collector, "_check_perf_paranoid", return_value=False):
+            result = collector.collect(task)
+        assert result.ok is False
+        assert "perf_event_paranoid" in result.reason
+
+    def test_pid_not_exists_returns_failure(self, collector: PerfCollector, task: CollectorTask):
+        with mock.patch("shutil.which", return_value="/usr/bin/perf"), \
+             mock.patch.object(collector, "_check_perf_paranoid", return_value=True), \
+             mock.patch.object(collector, "_pid_exists", return_value=False):
+            result = collector.collect(task)
+        assert result.ok is False
+        assert "不存在" in result.reason
+
+
+class TestPerfExecution:
+    """perf record 子进程执行路径。"""
+
+    def test_perf_completes_successfully(self, collector: PerfCollector, task: CollectorTask, tmp_path):
+        collector.OUTPUT_BASE = str(tmp_path)
+
+        perf_data = tmp_path / task.id / "perf.data"
+        perf_data.parent.mkdir(parents=True, exist_ok=True)
+        perf_data.write_text("perf data")
+
+        mock_proc = _mock_popen_complete()
+
+        with mock.patch("shutil.which", return_value="/usr/bin/perf"), \
+             mock.patch.object(collector, "_check_perf_paranoid", return_value=True), \
+             mock.patch.object(collector, "_pid_exists", return_value=True), \
+             mock.patch("subprocess.Popen", return_value=mock_proc), \
+             mock.patch("os.setpgrp", create=True):
+            result = collector.collect(task)
+
+        assert result.ok is True
+        assert result.artifacts[0]["artifact_type"] == "raw"
+        assert result.artifacts[0]["size_bytes"] > 0
+
+    def test_perf_nonzero_exit_returns_failure(self, collector: PerfCollector, task: CollectorTask, tmp_path):
+        collector.OUTPUT_BASE = str(tmp_path)
+
+        mock_proc = _mock_popen_complete(returncode=1, stderr=b"perf: target PID does not exist")
+
+        with mock.patch("shutil.which", return_value="/usr/bin/perf"), \
+             mock.patch.object(collector, "_check_perf_paranoid", return_value=True), \
+             mock.patch.object(collector, "_pid_exists", return_value=True), \
+             mock.patch("subprocess.Popen", return_value=mock_proc), \
+             mock.patch("os.setpgrp", create=True):
+            result = collector.collect(task)
+
+        assert result.ok is False
+        assert "perf record 执行失败" in result.reason
+
+    def test_perf_timeout_kills_process_group(self, collector: PerfCollector, task: CollectorTask, tmp_path):
+        collector.OUTPUT_BASE = str(tmp_path)
+
+        mock_proc = _mock_popen_complete(
+            pid=9999,
+            side_effect=subprocess.TimeoutExpired(cmd=["perf"], timeout=40),
+        )
+
+        with mock.patch("shutil.which", return_value="/usr/bin/perf"), \
+             mock.patch.object(collector, "_check_perf_paranoid", return_value=True), \
+             mock.patch.object(collector, "_pid_exists", return_value=True), \
+             mock.patch("subprocess.Popen", return_value=mock_proc), \
+             mock.patch("os.setpgrp", create=True), \
+             mock.patch("os.getpgid", create=True, return_value=9999), \
+             mock.patch("os.killpg", create=True) as mock_kill:
+            result = collector.collect(task)
+
+        assert result.ok is False
+        assert "超时" in result.reason
+        mock_kill.assert_called()
+
+
+class TestPidCheck:
+    """PID 存在性检查。"""
+
+    def test_pid_exists_on_linux_proc(self, collector: PerfCollector):
+        with mock.patch("os.path.isdir", return_value=True) as mock_isdir:
+            assert collector._pid_exists(1234) is True
+            mock_isdir.assert_called_with("/proc/1234")
+
+    def test_pid_missing_on_linux_proc(self, collector: PerfCollector):
+        with mock.patch("os.path.isdir", return_value=False):
+            assert collector._pid_exists(99999) is False
+
+
+class TestParanoidCheck:
+    """perf_event_paranoid 检查。"""
+
+    def test_paranoid_enabled(self, collector: PerfCollector):
+        mock_open = mock.mock_open(read_data="1\n")
+        with mock.patch("builtins.open", mock_open):
+            assert collector._check_perf_paranoid() is True
+
+    def test_paranoid_disabled(self, collector: PerfCollector):
+        mock_open = mock.mock_open(read_data="3\n")
+        with mock.patch("builtins.open", mock_open):
+            assert collector._check_perf_paranoid() is False
+
+    def test_paranoid_file_missing(self, collector: PerfCollector):
+        with mock.patch("builtins.open", side_effect=FileNotFoundError):
+            assert collector._check_perf_paranoid() is True

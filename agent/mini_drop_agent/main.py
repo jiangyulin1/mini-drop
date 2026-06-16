@@ -20,6 +20,8 @@ from typing import Any
 
 import grpc
 
+from agent.mini_drop_agent.collectors.base import CollectorTask
+from agent.mini_drop_agent.collectors.perf import PerfCollector
 from agent.mini_drop_agent.config import AgentConfig, load_config
 from server.app.generated import (
     healthcheck_pb2,
@@ -30,21 +32,38 @@ from server.app.generated import (
     init_pb2_grpc,
 )
 
+# ── 采集器注册 ────────────────────────────────────────────────────
+
+COLLECTORS = {
+    "perf_cpu": PerfCollector(),
+}
+
+CAPABILITIES = sorted(COLLECTORS.keys())
+
+
 # ── 任务执行 ───────────────────────────────────────────────────────
 
 
 def _run_collector(task_payload: dict[str, Any]) -> tuple[bool, str, list[dict[str, Any]]]:
-    """执行采集任务。
+    """执行采集任务：构造 CollectorTask 后分发到注册的采集器。
 
-    如果当前 Agent 构建没有注册对应 collector，明确上报失败，
-    而不是伪造采集产物。
-
-    Returns:
-        (ok, reason, artifacts)
+    如果 collector_type 不在 COLLECTORS 中，明确上报失败。
     """
     collector_type = task_payload.get("collector_type", "perf_cpu")
-    reason = f"collector {collector_type} is not registered in this agent build"
-    return False, reason, []
+    collector = COLLECTORS.get(collector_type)
+    if collector is None:
+        return False, f"collector {collector_type} 未在此 Agent 构建中注册", []
+
+    collector_task = CollectorTask(
+        id=task_payload["id"],
+        collector_type=collector_type,
+        target_pid=task_payload["target_pid"],
+        sample_rate=task_payload.get("sample_rate", 99),
+        duration_sec=task_payload.get("duration_sec", 15),
+        options=task_payload.get("request_params", {}).get("options", {}),
+    )
+    result = collector.collect(collector_task)
+    return result.ok, result.reason, result.artifacts
 
 
 # ── gRPC 客户端 ───────────────────────────────────────────────────
@@ -62,7 +81,7 @@ def _register(config: AgentConfig) -> None:
                 ip_addr="127.0.0.1",
                 version="0.1.0",
                 os_info=_os_info(),
-                capabilities=["perf_cpu", "ebpf_io", "pyspy", "continuous_perf"],
+                capabilities=CAPABILITIES,
             ),
             timeout=5,
         )

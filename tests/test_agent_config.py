@@ -5,7 +5,7 @@ from dataclasses import FrozenInstanceError
 import pytest
 
 from agent.mini_drop_agent.config import load_config
-from agent.mini_drop_agent.main import _run_collector
+from agent.mini_drop_agent.main import CAPABILITIES, COLLECTORS, _run_collector
 
 
 class TestAgentConfig:
@@ -50,11 +50,15 @@ class TestAgentConfig:
 class TestAgentCollectorDispatch:
     """Agent 任务执行入口。"""
 
+    def test_capabilities_match_registered_collectors(self):
+        assert CAPABILITIES == sorted(COLLECTORS.keys())
+        assert CAPABILITIES == ["perf_cpu"]
+
     def test_unregistered_collector_reports_failure_without_artifact(self):
         ok, reason, artifacts = _run_collector({
             "id": "task_001",
-            "collector_type": "perf_cpu",
+            "collector_type": "nonexistent_collector",
         })
         assert ok is False
-        assert "not registered" in reason
+        assert "未在此 Agent 构建中注册" in reason
         assert artifacts == []
