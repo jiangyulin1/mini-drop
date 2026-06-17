@@ -1,0 +1,289 @@
+"""DeepSeek API 客户端。
+
+工程校验层：LLM JSON 响应的格式校验 → 证据引用完整性 → 自修复重试。
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import time
+
+import requests
+
+from server.app.rca.models import CauseEntry, DiagnosisReport, EvidenceInput, ValidatedReport
+from server.app.rca.prompt import build_system_prompt, build_user_message
+
+
+# 最大自修复重试次数
+MAX_RETRIES = 2
+
+# DeepSeek API 基础 URL（在调用时读取 KEY 以保证 mock 环境变量可生效）
+API_BASE = os.getenv("DEEPSEEK_API_BASE", "https://api.deepseek.com")
+
+
+def _get_api_key() -> str:
+    return os.getenv("DEEPSEEK_API_KEY", "")
+
+
+def diagnose(
+    task_id: str,
+    evidence: EvidenceInput,
+    candidates_json: str,
+    model_name: str = "deepseek-chat",
+) -> ValidatedReport:
+    """执行智能归因：LLM 推理 + 校验 + 自修复。
+
+    Args:
+        task_id: 任务 ID。
+        evidence: 结构化证据。
+        candidates_json: 校准后候选原因列表的 JSON 字符串。
+        model_name: DeepSeek 模型名。
+
+    Returns:
+        ValidatedReport，包含校验通过的 DiagnosisReport。
+    """
+    evidence_json = _serialize_evidence(evidence)
+    system_prompt = build_system_prompt(model_name)
+    user_message = build_user_message(evidence_json, candidates_json)
+
+    if not _get_api_key():
+        return _fallback_report(task_id, evidence)
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_message},
+    ]
+
+    last_error = ""
+    for attempt in range(1 + MAX_RETRIES):
+        try:
+            raw = _call_deepseek(messages, model_name)
+            report, issues = _validate_and_parse(raw, evidence)
+            if not issues:
+                return ValidatedReport(
+                    task_id=task_id,
+                    model_name=model_name,
+                    evidence_snapshot=json.loads(evidence_json),
+                    report=report,
+                    validated=True,
+                    retry_count=attempt,
+                )
+
+            # 校验失败 → 构造修复提示追加到 messages
+            last_error = "; ".join(issues)
+            repair_prompt = (
+                f"上一次你的输出校验失败：{last_error}\n"
+                "请修正后重新输出 JSON。"
+            )
+            messages.append({"role": "assistant", "content": raw[:200]})
+            messages.append({"role": "user", "content": repair_prompt})
+
+        except Exception as exc:
+            last_error = str(exc)
+            if attempt < MAX_RETRIES:
+                time.sleep(1 * (attempt + 1))  # 指数退避
+                continue
+
+    # 全部重试失败
+    return ValidatedReport(
+        task_id=task_id,
+        model_name=model_name,
+        evidence_snapshot=json.loads(evidence_json) if evidence_json else {},
+        report=DiagnosisReport(
+            summary=f"归因失败（已重试 {MAX_RETRIES} 次）: {last_error}",
+            ranked_causes=[],
+            facts=[],
+            not_enough_evidence=True,
+        ),
+        validated=False,
+        validation_issues=[last_error],
+        retry_count=MAX_RETRIES,
+    )
+
+
+# ── 内部 ──
+
+
+def _serialize_evidence(evidence: EvidenceInput) -> str:
+    """将证据序列化为 JSON，字段按近因效应排序——越重要的越靠后。"""
+    from server.app.rca.evidence import evidence_to_json
+    return evidence_to_json(evidence)
+
+
+def _call_deepseek(messages: list[dict], model: str) -> str:
+    """调用 DeepSeek Chat API。
+
+    Args:
+        messages: 对话历史（system + user）。
+        model: 模型名称。
+
+    Returns:
+        LLM 原始响应文本。
+
+    Raises:
+        RuntimeError: API 返回非 200。
+    """
+    resp = requests.post(
+        f"{API_BASE}/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {_get_api_key()}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": model,
+            "messages": messages,
+            "temperature": 0.1,  # 低温：归因需要确定性而非创意
+            "max_tokens": 2048,
+            "response_format": {"type": "json_object"},
+        },
+        timeout=60,
+    )
+
+    if resp.status_code != 200:
+        raise RuntimeError(f"DeepSeek API 返回 {resp.status_code}: {resp.text[:300]}")
+
+    body = resp.json()
+    content = body["choices"][0]["message"]["content"]
+    return content
+
+
+def _validate_and_parse(raw: str, evidence: EvidenceInput) -> tuple[DiagnosisReport | None, list[str]]:
+    """校验 LLM 输出并解析为 DiagnosisReport。
+
+    校验规则：
+      1. JSON 可解析
+      2. 所有字段类型正确（通过 Pydantic 校验）
+      3. 每条 cause 的 evidence_refs 必须引用 evidence 中存在的字段
+      4. confidence 在 [0, 1]
+      5. ranked_causes 不空（除非 not_enough_evidence=True）
+    """
+    issues: list[str] = []
+
+    # 步骤 1：提取 JSON
+    json_text = _extract_json(raw)
+    if not json_text:
+        return None, ["无法从 LLM 输出中提取 JSON"]
+
+    # 步骤 2：Pydantic 解析
+    try:
+        data = json.loads(json_text)
+    except json.JSONDecodeError as exc:
+        return None, [f"JSON 解析失败: {exc}"]
+
+    try:
+        report = DiagnosisReport(**data)
+    except Exception as exc:
+        return None, [f"Schema 校验失败: {exc}"]
+
+    # 步骤 3：证据引用完整性——每条 cause 的 evidence_refs 必须在 evidence 中可找到
+    valid_paths = _collect_evidence_paths(evidence)
+    for i, cause in enumerate(report.ranked_causes):
+        for ref in cause.evidence_refs:
+            if not _ref_exists(ref, valid_paths):
+                issues.append(f"ranked_causes[{i}].evidence_refs 中的 '{ref}' 不在证据路径中")
+
+    # 步骤 4：边界校验
+    if report.not_enough_evidence and not report.ranked_causes:
+        pass  # 证据不足 + 无候选 = 合理
+    elif not report.ranked_causes and not report.not_enough_evidence:
+        issues.append("ranked_causes 为空但 not_enough_evidence=false")
+
+    if issues:
+        return None, issues
+
+    return report, []
+
+
+def _extract_json(raw: str) -> str | None:
+    """从 LLM 原始输出中提取 JSON。
+
+    处理以下情况：
+      - 纯 JSON
+      - ```json ... ``` 包裹
+      - ``` ... ``` 包裹
+    """
+    text = raw.strip()
+
+    # 尝试匹配 ```json ... ``` 或 ``` ... ```
+    m = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+
+    # 尝试找到第一个 { 到最后一个 }
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        return text[start:end + 1]
+
+    return None
+
+
+def _collect_evidence_paths(evidence: EvidenceInput) -> dict[str, set[str]]:
+    """收集 evidence 中所有可引用的字段路径。
+
+    Returns:
+        {"top_functions": {"name", "samples", "percent"}, ...}
+    """
+    paths: dict[str, set[str]] = {}
+
+    if evidence.top_functions:
+        paths["top_functions"] = set()
+        for item in evidence.top_functions[:3]:
+            paths["top_functions"].update(item.keys())
+
+    if evidence.ebpf_metrics:
+        paths["ebpf_metrics"] = set(evidence.ebpf_metrics.keys())
+
+    if evidence.baseline_diff:
+        paths["baseline_diff"] = set(evidence.baseline_diff.keys())
+
+    if evidence.agent_stats:
+        paths["agent_stats"] = set(evidence.agent_stats.keys())
+
+    if evidence.task_metadata:
+        paths["task_metadata"] = set(evidence.task_metadata.keys())
+
+    return paths
+
+
+def _ref_exists(ref: str, valid_paths: dict[str, set[str]]) -> bool:
+    """检查 evidence_ref 是否在有效路径集合中。
+
+    支持两种格式：
+      - "top_functions" → 检查顶层 key 存在
+      - "top_functions[0]" → 检查顶层 key 存在且是列表
+      - "task_metadata.status" → 检查嵌套路径
+    """
+    # 去掉索引后缀: "top_functions[0]" → "top_functions"
+    base = re.sub(r"\[\d+\]", "", ref)
+    # 取顶层 key: "task_metadata.status" → "task_metadata"
+    top = base.split(".")[0]
+
+    if top not in valid_paths:
+        return False
+
+    # 如果有二级字段，检查是否在有效子路径中
+    if "." in base:
+        sub = base.split(".", 1)[1]
+        return sub in valid_paths[top]
+
+    return True
+
+
+def _fallback_report(task_id: str, evidence: EvidenceInput) -> ValidatedReport:
+    """API Key 未配置时的降级报告（纯规则引擎输出）。"""
+    return ValidatedReport(
+        task_id=task_id,
+        model_name="rule-engine-only",
+        evidence_snapshot=evidence.model_dump() if isinstance(evidence, EvidenceInput) else {},
+        report=DiagnosisReport(
+            summary="未配置 DEEPSEEK_API_KEY，归因引擎降级为纯规则匹配模式。"
+                    "请设置环境变量以启用 AI 增强归因。",
+            ranked_causes=[],
+            facts=evidence.suggestions if evidence.suggestions else ["无规则命中"],
+            not_enough_evidence=True,
+        ),
+        validated=True,
+    )

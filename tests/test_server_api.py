@@ -247,8 +247,10 @@ class TestDiagnose:
         task_id = resp.json()["data"]["task_id"]
         diag = client.post(f"/api/tasks/{task_id}/diagnose").json()["data"]
         assert diag["report_id"].startswith("diag_")
-        assert diag["status"] == "QUEUED"
         assert diag["task_id"] == task_id
+        assert "summary" in diag
+        assert "ranked_causes" in diag
+        assert "model" in diag
 
     def test_diagnose_404_for_nonexistent(self, client: TestClient):
         resp = client.post("/api/tasks/nope/diagnose")

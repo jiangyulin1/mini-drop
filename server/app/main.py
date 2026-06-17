@@ -8,13 +8,16 @@ Web 通过 HTTP API 即时可见。
 
 from __future__ import annotations
 
+import json as _json_mod
 import os
 from contextlib import asynccontextmanager
+from pathlib import Path as _Path
 
 from fastapi import FastAPI, HTTPException
 
 from server.app.database import init_db
 from server.app.grpc_server import serve_in_background
+from server.app.rca.report import run_diagnosis
 from server.app.schemas import (
     APIResponse,
     CreateTaskRequest,
@@ -156,13 +159,45 @@ def presign_url(bucket: str = "mini-drop", key: str = "", expires: int = 3600) -
 
 @app.post("/api/tasks/{task_id}/diagnose")
 def diagnose_task(task_id: str) -> APIResponse:
-    if task_id not in repo.tasks:
+    task = repo.tasks.get(task_id)
+    if task is None:
         raise HTTPException(status_code=404, detail="任务不存在")
+
+    # 收集已有 artifacts 中的结构化数据
+    artifacts = repo.artifacts.get(task_id, [])
+    top_functions = _extract_artifact_json(artifacts, "top_json")
+    ebpf_metrics = _extract_artifact_json(artifacts, "ebpf_metrics")
+
+    report = run_diagnosis(
+        task_id=task_id,
+        task_record=task,
+        top_functions=top_functions,
+        ebpf_metrics=ebpf_metrics,
+    )
+
     return APIResponse(data={
         "report_id": f"diag_{task_id}",
-        "status": "QUEUED",
         "task_id": task_id,
+        "model": report.model_name,
+        "validated": report.validated,
+        "summary": report.report.summary,
+        "ranked_causes": [c.model_dump() for c in report.report.ranked_causes],
+        "facts": report.report.facts,
+        "not_enough_evidence": report.report.not_enough_evidence,
     })
+
+
+def _extract_artifact_json(artifacts: list[dict], artifact_type: str) -> dict | None:
+    """从 artifacts 列表中提取指定类型的 JSON 数据。"""
+    for art in artifacts:
+        if art.get("artifact_type") == artifact_type:
+            local_path = art.get("local_path", "")
+            if local_path and os.path.isfile(local_path):
+                try:
+                    return _json_mod.loads(_Path(local_path).read_text(encoding="utf-8"))
+                except Exception:
+                    return None
+    return None
 
 
 # ── 启动入口 ──────────────────────────────────────────────────

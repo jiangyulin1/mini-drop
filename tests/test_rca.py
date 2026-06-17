@@ -1,0 +1,408 @@
+"""智能归因模块测试。
+
+覆盖：证据采集 / 候选规则匹配 / 置信度校准 /
+       Prompt 模板 / 输出校验 / 自修复重试 / 降级行为。
+"""
+
+import json
+from unittest import mock
+
+import pytest
+
+from server.app.rca.calibrator import calibrate, interpret_confidence
+from server.app.rca.candidates import generate_candidates
+from server.app.rca.evidence import collect_evidence, evidence_to_json
+from server.app.rca.llm_client import _extract_json, _validate_and_parse, _ref_exists, _collect_evidence_paths
+from server.app.rca.models import CandidateCause, DiagnosisReport, EvidenceInput, FeedbackPrior
+from server.app.rca.prompt import build_system_prompt, build_user_message
+from server.app.rca.report import run_diagnosis
+
+
+# ── 模拟 Task Record ──
+
+
+class _FakeTask:
+    def __init__(self):
+        self.id = "task_test"
+        self.collector_type = "perf_cpu"
+        self.target_pid = 1234
+        self.duration_sec = 15
+        self.sample_rate = 99
+        self.status = "DONE"
+        self.status_reason = "analysis completed"
+
+
+# ── 证据采集 ──
+
+
+class TestEvidenceCollection:
+    """证据采集层。"""
+
+    def test_collects_all_fields(self):
+        task = _FakeTask()
+        ev = collect_evidence(
+            task_id=task.id, task_record=task,
+            top_functions=[{"name": "fib", "samples": 100, "percent": 68.0}],
+            ebpf_metrics={"io_latency_us": {"[128,256)": 10}},
+            suggestions=["检查递归"],
+            failure_events=["permission denied"],
+            baseline_diff={"cpu_percent_delta": 42.0},
+            agent_stats={"max_cpu_percent": 3.1},
+        )
+        assert ev.task_metadata["collector_type"] == "perf_cpu"
+        assert len(ev.top_functions) == 1
+        assert ev.ebpf_metrics is not None
+        assert len(ev.suggestions) == 1
+        assert len(ev.failure_events) == 1
+        assert ev.baseline_diff is not None
+
+    def test_evidence_json_is_valid(self):
+        task = _FakeTask()
+        ev = collect_evidence(task_id="t1", task_record=task,
+                              top_functions=[{"name": "f", "samples": 1, "percent": 100.0}])
+        text = evidence_to_json(ev)
+        data = json.loads(text)
+        assert "task_metadata" in data
+        assert "top_functions" in data
+
+    def test_fields_ordered_by_recency(self):
+        """top_functions 应出现在 ebpf_metrics 之前（证据按重要性排序，
+        越重要越靠后 → 近因效应）。实际输出中重要字段放在后面。"""
+        task = _FakeTask()
+        ev = collect_evidence(task_id="t1", task_record=task,
+                              top_functions=[{"name": "f", "samples": 1, "percent": 50.0}],
+                              ebpf_metrics={"latency": {}})
+        text = evidence_to_json(ev)
+        # ebpf_metrics 应在 top_functions 之后出现（JSON 字符串位置）
+        tf_pos = text.index("top_functions")
+        ebpf_pos = text.index("ebpf_metrics")
+        assert tf_pos < ebpf_pos
+
+
+# ── 候选规则 ──
+
+
+class TestCandidateGeneration:
+    """规则引擎。"""
+
+    def test_cpu_hotspot_matched(self):
+        task = _FakeTask()
+        ev = collect_evidence(task_id="t1", task_record=task,
+                              top_functions=[{"name": "fib_hotspot", "samples": 100, "percent": 68.5}])
+        candidates = generate_candidates(ev)
+        ids = [c.candidate_id for c in candidates]
+        assert "cpu_hotspot_recursive" in ids
+
+    def test_io_wait_matched_from_ebpf(self):
+        task = _FakeTask()
+        task.collector_type = "ebpf_io"
+        ev = collect_evidence(task_id="t1", task_record=task,
+                              ebpf_metrics={"io_latency_us": {"[128,256)": 10}})
+        candidates = generate_candidates(ev)
+        assert any(c.candidate_id == "io_wait_high" for c in candidates)
+
+    def test_no_rules_fallback(self):
+        task = _FakeTask()
+        ev = collect_evidence(task_id="t1", task_record=task)
+        candidates = generate_candidates(ev)
+        assert len(candidates) == 1
+        assert candidates[0].candidate_id == "insufficient_data"
+
+    def test_target_pid_invalid_matched(self):
+        task = _FakeTask()
+        task.status = "FAILED"
+        ev = collect_evidence(task_id="t1", task_record=task,
+                              failure_events=["目标 PID 不存在"])
+        candidates = generate_candidates(ev)
+        assert any(c.candidate_id == "target_pid_invalid" for c in candidates)
+
+    def test_feedback_prior_adjusts_score(self):
+        task = _FakeTask()
+        ev = collect_evidence(task_id="t1", task_record=task,
+                              top_functions=[{"name": "fib_hotspot", "samples": 100, "percent": 68.5}])
+        candidates_no_prior = generate_candidates(ev)
+
+        priors = {"cpu_hotspot_recursive": FeedbackPrior(
+            candidate_id="cpu_hotspot_recursive", positive_count=2, negative_count=0, weight_delta=0.10)}
+        candidates_with_prior = generate_candidates(ev, priors)
+
+        cpu_no = next(c for c in candidates_no_prior if c.candidate_id == "cpu_hotspot_recursive")
+        cpu_with = next(c for c in candidates_with_prior if c.candidate_id == "cpu_hotspot_recursive")
+        assert cpu_with.rule_score > cpu_no.rule_score
+
+
+# ── 置信度校准 ──
+
+
+class TestCalibrator:
+    """校准器。"""
+
+    def test_calibration_outputs_confidence(self):
+        ev = EvidenceInput(task_metadata={"duration_sec": 15},
+                           top_functions=[{"name": "f", "samples": 100, "percent": 80.0}])
+        candidates = [CandidateCause(
+            candidate_id="cpu_hotspot_recursive",
+            description="CPU hotspot",
+            evidence_refs=["top_functions[0]"],
+            rule_score=0.83,
+        )]
+        calibrated = calibrate(candidates, ev)
+        assert len(calibrated) == 1
+        assert 0.0 <= calibrated[0].final_confidence <= 1.0
+
+    def test_confidence_interpretation(self):
+        assert interpret_confidence(0.85) == "高置信"
+        assert interpret_confidence(0.70) == "可能"
+        assert interpret_confidence(0.50) == "待验证"
+        assert interpret_confidence(0.30) == "证据不足"
+
+
+# ── Prompt 模板 ──
+
+
+class TestPromptTemplate:
+    """System prompt 和 user message 生成。"""
+
+    def test_prompt_contains_constraints(self):
+        prompt = build_system_prompt()
+        assert "硬性约束" in prompt
+        assert "evidence_refs" in prompt
+        assert "样例" in prompt
+
+    def test_prompt_contains_few_shots(self):
+        prompt = build_system_prompt()
+        assert "fib_hotspot" in prompt  # shot 1
+        assert "io_wait_high" in prompt  # shot 2
+        assert "debuginfo" in prompt  # shot 3
+
+    def test_prompt_duplicates_constraints(self):
+        """核心约束应在 prompt 头尾各出现一次，对抗遗忘。"""
+        prompt = build_system_prompt()
+        count = prompt.count("硬性约束")
+        assert count >= 2
+
+    def test_user_message_puts_evidence_at_end(self):
+        msg = build_user_message('{"top":[]}', '[{"id":"x"}]')
+        assert "当前证据" in msg
+        assert "候选原因" in msg
+        assert msg.index("当前证据") < msg.index("候选原因")
+
+    def test_model_tag_in_prompt(self):
+        prompt = build_system_prompt("deepseek-chat")
+        assert "DeepSeek Chat" in prompt
+
+    def test_flash_model_tag(self):
+        prompt = build_system_prompt("deepseek-4-flash")
+        assert "DeepSeek V4 Flash" in prompt
+
+
+# ── JSON 提取 ──
+
+
+class TestJsonExtraction:
+    """从 LLM 原始输出提取 JSON。"""
+
+    def test_extracts_plain_json(self):
+        assert _extract_json('{"a":1}') == '{"a":1}'
+
+    def test_extracts_from_code_block(self):
+        raw = '```json\n{"summary":"test"}\n```'
+        assert _extract_json(raw) == '{"summary":"test"}'
+
+    def test_extracts_from_non_json_block(self):
+        raw = '```\n{"x":1}\n```'
+        assert _extract_json(raw) == '{"x":1}'
+
+    def test_extracts_nested_json(self):
+        raw = 'Some text\n{"ranked_causes":[{"cause_id":"c1"}]}\nMore text'
+        result = _extract_json(raw)
+        assert result is not None
+        assert "ranked_causes" in result
+
+    def test_no_json_returns_none(self):
+        assert _extract_json("just plain text no json") is None
+
+
+# ── 校验与解析 ──
+
+
+class TestValidationAndParsing:
+    """LLM 输出校验 + 自修复。"""
+
+    def test_valid_report_passes(self):
+        evidence = EvidenceInput(
+            task_metadata={"duration_sec": 15},
+            top_functions=[{"name": "fib", "samples": 100, "percent": 68.5}],
+            baseline_diff={"cpu_percent_delta": 42.0},
+        )
+        raw = json.dumps({
+            "summary": "CPU 热点在 fib",
+            "ranked_causes": [{
+                "cause_id": "cpu_hotspot_recursive",
+                "confidence": 0.85,
+                "claim": "fib 导致高 CPU",
+                "evidence_refs": ["top_functions[0]", "baseline_diff"],
+                "uncertainties": [],
+                "verification_steps": ["加入缓存重测"],
+            }],
+            "facts": ["fib 占 68.5%"],
+            "not_enough_evidence": False,
+        })
+        report, issues = _validate_and_parse(raw, evidence)
+        assert report is not None
+        assert issues == []
+        assert report.summary == "CPU 热点在 fib"
+
+    def test_bad_evidence_ref_rejected(self):
+        evidence = EvidenceInput()
+        raw = json.dumps({
+            "summary": "test",
+            "ranked_causes": [{
+                "cause_id": "x",
+                "confidence": 0.5,
+                "claim": "bad",
+                "evidence_refs": ["nonexistent_field"],
+                "uncertainties": [],
+                "verification_steps": [],
+            }],
+            "facts": [],
+            "not_enough_evidence": False,
+        })
+        report, issues = _validate_and_parse(raw, evidence)
+        assert report is None
+        assert len(issues) > 0
+        assert "evidence_refs" in issues[0]
+
+    def test_missing_required_fields_rejected(self):
+        evidence = EvidenceInput()
+        raw = '{"summary":"x"}'
+        report, issues = _validate_and_parse(raw, evidence)
+        assert report is None
+        assert len(issues) > 0
+
+    def test_invalid_json_rejected(self):
+        evidence = EvidenceInput()
+        report, issues = _validate_and_parse("not json", evidence)
+        assert report is None
+
+    def test_not_enough_evidence_without_causes_is_ok(self):
+        evidence = EvidenceInput()
+        raw = json.dumps({
+            "summary": "insufficient data",
+            "ranked_causes": [],
+            "facts": ["few samples"],
+            "not_enough_evidence": True,
+        })
+        report, issues = _validate_and_parse(raw, evidence)
+        assert report is not None
+        assert issues == []
+
+    def test_empty_causes_without_flag_fails(self):
+        evidence = EvidenceInput()
+        raw = json.dumps({
+            "summary": "empty",
+            "ranked_causes": [],
+            "facts": [],
+            "not_enough_evidence": False,
+        })
+        report, issues = _validate_and_parse(raw, evidence)
+        assert report is None
+
+    def test_ref_exists_in_evidence(self):
+        paths = {"top_functions": {"name", "samples", "percent"}}
+        assert _ref_exists("top_functions[0]", paths) is True
+        assert _ref_exists("top_functions", paths) is True
+        assert _ref_exists("nonexistent", paths) is False
+
+
+# ── 自修复重试 ──
+
+
+class TestSelfRepair:
+    """LLM 调用失败后的自修复重试。"""
+
+    def test_retries_on_validation_failure(self):
+        """首次返回 bad JSON → 重试返回 good JSON。"""
+        evidence = EvidenceInput(
+            task_metadata={"duration_sec": 15},
+            top_functions=[{"name": "fib", "samples": 100, "percent": 68.5}],
+            baseline_diff={"cpu_percent_delta": 42.0},
+        )
+        good_json = json.dumps({
+            "summary": "after repair",
+            "ranked_causes": [{
+                "cause_id": "cpu_hotspot_recursive",
+                "confidence": 0.80,
+                "claim": "fixed",
+                "evidence_refs": ["top_functions[0]"],
+                "uncertainties": [],
+                "verification_steps": ["step"],
+            }],
+            "facts": ["f1"],
+            "not_enough_evidence": False,
+        })
+
+        # mock: 第一次返回坏 JSON → 第二次返回好 JSON
+        mock_resp_bad = mock.MagicMock(status_code=200)
+        mock_resp_bad.json.return_value = {
+            "choices": [{"message": {"content": '{"summary":"bad","ranked_causes":[]}'}}]
+        }
+        mock_resp_good = mock.MagicMock(status_code=200)
+        mock_resp_good.json.return_value = {
+            "choices": [{"message": {"content": good_json}}]
+        }
+
+        with mock.patch.dict("os.environ", {"DEEPSEEK_API_KEY": "fake-key"}):
+            with mock.patch("requests.post", side_effect=[mock_resp_bad, mock_resp_good]):
+                from server.app.rca.llm_client import diagnose
+                result = diagnose(
+                    task_id="t1",
+                    evidence=evidence,
+                    candidates_json='[{"candidate_id":"cpu_hotspot_recursive"}]',
+                )
+                assert result.validated is True
+                assert result.retry_count == 1
+                assert result.report.summary == "after repair"
+
+    def test_max_retries_exceeded_returns_failure(self):
+        evidence = EvidenceInput()
+        bad_json = '{"summary":"x","ranked_causes":[],"facts":[],"not_enough_evidence":false}'
+
+        mock_resp = mock.MagicMock(status_code=200)
+        mock_resp.json.return_value = {
+            "choices": [{"message": {"content": bad_json}}]
+        }
+
+        with mock.patch.dict("os.environ", {"DEEPSEEK_API_KEY": "fake-key"}):
+            with mock.patch("requests.post", return_value=mock_resp):
+                from server.app.rca.llm_client import diagnose
+                result = diagnose(
+                    task_id="t1",
+                    evidence=evidence,
+                    candidates_json="[]",
+                )
+                assert result.validated is False
+                assert result.retry_count >= 1
+
+
+# ── 降级行为 ──
+
+
+class TestFallback:
+    """API Key 未配置时的降级。"""
+
+    def test_no_api_key_returns_rule_only(self):
+        evidence = EvidenceInput(task_metadata={"collector_type": "perf_cpu"})
+        with mock.patch.dict("os.environ", {}, clear=True):
+            from server.app.rca.llm_client import diagnose
+            result = diagnose(task_id="t1", evidence=evidence, candidates_json="[]")
+            assert result.model_name == "rule-engine-only"
+            assert result.report.not_enough_evidence is True
+
+    def test_run_diagnosis_with_no_key(self):
+        task = _FakeTask()
+        with mock.patch.dict("os.environ", {}, clear=True):
+            result = run_diagnosis(task_id="t1", task_record=task,
+                                   top_functions=[{"name": "fib", "samples": 100, "percent": 68.5}])
+            assert result is not None
+            assert result.model_name == "rule-engine-only"
