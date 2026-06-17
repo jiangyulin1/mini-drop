@@ -107,3 +107,12 @@ class AuditLogView(BaseModel):
     task_id: Optional[str] = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=lambda: datetime.utcnow())
+
+
+class RCAFeedbackRequest(BaseModel):
+    """用户对 RCA 诊断结果的反馈。"""
+
+    predicted_cause_id: str
+    feedback_label: Literal["correct", "wrong", "partial", "unknown"]
+    corrected_cause_id: Optional[str] = None
+    feedback_note: Optional[str] = None

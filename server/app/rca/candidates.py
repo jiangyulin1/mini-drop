@@ -1,124 +1,52 @@
 """候选归因规则引擎。
 
-基于结构化证据自动生成候选原因，LLM 不对凭空猜测负责——
-候选原因由规则引擎和工具结果产生。
+规则定义外部化到 rules.json。配置文件只声明 match_type 和参数，
+具体执行由本模块中的白名单 matcher 完成，避免把规则配置变成任意代码入口。
 """
 
 from __future__ import annotations
 
+import json
+from functools import lru_cache
+from pathlib import Path
+from typing import Any
+
 from server.app.rca.models import CandidateCause, EvidenceInput, FeedbackPrior
 
-
-# ── 规则定义 ──
-
-_RULES = [
-    {
-        "candidate_id": "cpu_hotspot_recursive",
-        "description": "单一计算函数占 CPU 采样数比例过高，可能存在递归或密集型计算瓶颈",
-        "match": lambda ev: (
-            len(ev.top_functions) > 0
-            and ev.top_functions[0].get("percent", 0) > 40
-            and any(kw in ev.top_functions[0].get("name", "").lower()
-                    for kw in ("fib", "recursive", "loop", "compute", "hotspot"))
-        ),
-        "rule_score": 0.83,
-    },
-    {
-        "candidate_id": "io_wait_high",
-        "description": "块设备 IO 延迟异常，可能是磁盘带宽或 IOPS 达到上限",
-        "match": lambda ev: (
-            ev.ebpf_metrics is not None
-            and "io_latency_us" in ev.ebpf_metrics
-            and len(ev.ebpf_metrics.get("io_latency_us", {})) > 0
-        ),
-        "rule_score": 0.78,
-    },
-    {
-        "candidate_id": "python_userland_hotspot",
-        "description": "Python 用户态函数热点，与 perf 系统级热点一致，根因在应用层",
-        "match": lambda ev: (
-            ev.task_metadata.get("collector_type") == "pyspy"
-            or any("python" in s.lower() for s in ev.suggestions)
-        ),
-        "rule_score": 0.72,
-    },
-    {
-        "candidate_id": "agent_overhead",
-        "description": "采集 Agent 自身资源开销过高，可能影响目标进程性能",
-        "match": lambda ev: (
-            ev.agent_stats is not None
-            and ev.agent_stats.get("max_cpu_percent", 0) > 10
-        ),
-        "rule_score": 0.55,
-    },
-    {
-        "candidate_id": "collector_permission_denied",
-        "description": "采集权限不足导致采集失败或结果异常",
-        "match": lambda ev: (
-            ev.task_metadata.get("status") == "FAILED"
-            and any("permission" in s.lower() or "权限" in s
-                    for s in ev.failure_events)
-        ),
-        "rule_score": 0.90,
-    },
-    {
-        "candidate_id": "target_pid_invalid",
-        "description": "目标 PID 不存在或在采集期间退出",
-        "match": lambda ev: (
-            ev.task_metadata.get("status") == "FAILED"
-            and any("不存在" in s or "exited" in s.lower() or "not found" in s.lower()
-                    for s in ev.failure_events)
-        ),
-        "rule_score": 0.95,
-    },
-]
+RULES_PATH = Path(__file__).with_name("rules.json")
 
 
 def generate_candidates(
     evidence: EvidenceInput,
     feedback_priors: dict[str, FeedbackPrior] | None = None,
 ) -> list[CandidateCause]:
-    """规则引擎生成候选归因列表。
-
-    Args:
-        evidence: 结构化证据。
-        feedback_priors: 历史反馈先验（可选），用于调整候选排序。
-
-    Returns:
-        按 rule_score 降序排列的候选原因列表。
-    """
+    """规则引擎生成候选归因列表。"""
     candidates: list[CandidateCause] = []
     priors = feedback_priors or {}
 
-    for rule in _RULES:
+    for rule in load_rules():
         try:
-            matched = rule["match"](evidence)
+            matched = _match_rule(rule, evidence)
         except Exception:
             matched = False
 
         if not matched:
             continue
 
-        evidence_refs = _infer_refs(rule["candidate_id"], evidence)
-        missing = _detect_missing_evidence(rule["candidate_id"], evidence)
-        score = rule["rule_score"]
-
-        # 反馈先验修正：正确反馈 +0.05，错误 -0.08
-        if rule["candidate_id"] in priors:
-            prior = priors[rule["candidate_id"]]
-            score += prior.weight_delta
+        candidate_id = rule["candidate_id"]
+        score = float(rule.get("rule_score", 0.0))
+        if candidate_id in priors:
+            score += priors[candidate_id].weight_delta
 
         candidates.append(CandidateCause(
-            candidate_id=rule["candidate_id"],
+            candidate_id=candidate_id,
             description=rule["description"],
-            evidence_refs=evidence_refs,
+            evidence_refs=_filter_available_refs(rule.get("evidence_refs", []), evidence),
             rule_score=min(max(score, 0.0), 1.0),
-            missing_evidence=missing,
+            missing_evidence=_detect_missing_evidence(candidate_id, evidence),
         ))
 
-    candidates.sort(key=lambda c: c.rule_score, reverse=True)
-
-    # 如果没有规则命中，生成一个兜底候选
+    candidates.sort(key=lambda item: item.rule_score, reverse=True)
     if not candidates:
         candidates.append(CandidateCause(
             candidate_id="insufficient_data",
@@ -127,42 +55,113 @@ def generate_candidates(
             rule_score=0.10,
             missing_evidence=["更长的采样时长", "多采集器交叉验证", "历史基线对比"],
         ))
-
     return candidates
 
 
-def _infer_refs(candidate_id: str, evidence: EvidenceInput) -> list[str]:
-    """根据候选原因类型推断相关证据引用字段。"""
-    refs: list[str] = []
-    mapping: dict[str, list[str]] = {
-        "cpu_hotspot_recursive": ["top_functions[0]", "baseline_diff"],
-        "io_wait_high": ["ebpf_metrics.io_latency_us", "baseline_diff"],
-        "python_userland_hotspot": ["top_functions", "suggestions"],
-        "agent_overhead": ["agent_stats"],
-        "collector_permission_denied": ["failure_events", "task_metadata.status"],
-        "target_pid_invalid": ["failure_events", "task_metadata.target_pid"],
-    }
-    return mapping.get(candidate_id, [])
+@lru_cache(maxsize=1)
+def load_rules(path: str | None = None) -> list[dict[str, Any]]:
+    """加载外部规则配置。测试可传入 path 或 clear cache 后重载。"""
+    rules_path = Path(path) if path else RULES_PATH
+    data = json.loads(rules_path.read_text(encoding="utf-8"))
+    if not isinstance(data, list):
+        raise ValueError("RCA 规则文件必须是数组")
+    for item in data:
+        _validate_rule(item)
+    return data
+
+
+def _validate_rule(rule: dict[str, Any]) -> None:
+    required = {"candidate_id", "description", "match_type", "rule_score"}
+    missing = sorted(required - set(rule))
+    if missing:
+        raise ValueError(f"RCA 规则缺少字段: {', '.join(missing)}")
+    if rule["match_type"] not in _MATCHERS:
+        raise ValueError(f"未知 RCA match_type: {rule['match_type']}")
+
+
+def _match_rule(rule: dict[str, Any], evidence: EvidenceInput) -> bool:
+    matcher = _MATCHERS[rule["match_type"]]
+    return matcher(evidence, rule.get("params", {}))
+
+
+def _match_top_function_keyword(evidence: EvidenceInput, params: dict[str, Any]) -> bool:
+    if not evidence.top_functions:
+        return False
+    top = evidence.top_functions[0]
+    if float(top.get("percent", 0)) < float(params.get("min_percent", 40)):
+        return False
+    name = top.get("name", "").lower()
+    return any(keyword.lower() in name for keyword in params.get("keywords", []))
+
+
+def _match_ebpf_latency_present(evidence: EvidenceInput, _params: dict[str, Any]) -> bool:
+    histogram = evidence.ebpf_metrics.get("io_latency_us", {}) if evidence.ebpf_metrics else {}
+    return isinstance(histogram, dict) and len(histogram) > 0
+
+
+def _match_collector_or_suggestion(evidence: EvidenceInput, params: dict[str, Any]) -> bool:
+    collector_type = params.get("collector_type", "")
+    if evidence.task_metadata.get("collector_type") == collector_type:
+        return True
+    keyword = params.get("suggestion_keyword", "").lower()
+    return bool(keyword) and any(keyword in item.lower() for item in evidence.suggestions)
+
+
+def _match_agent_cpu_overhead(evidence: EvidenceInput, params: dict[str, Any]) -> bool:
+    threshold = float(params.get("min_cpu_percent", 10))
+    return float(evidence.agent_stats.get("max_cpu_percent", 0)) > threshold
+
+
+def _match_failure_contains(evidence: EvidenceInput, params: dict[str, Any]) -> bool:
+    status = params.get("status")
+    if status and evidence.task_metadata.get("status") != status:
+        return False
+    joined = "\n".join(evidence.failure_events).lower()
+    return any(keyword.lower() in joined for keyword in params.get("keywords", []))
+
+
+_MATCHERS = {
+    "top_function_keyword": _match_top_function_keyword,
+    "ebpf_latency_present": _match_ebpf_latency_present,
+    "collector_or_suggestion": _match_collector_or_suggestion,
+    "agent_cpu_overhead": _match_agent_cpu_overhead,
+    "failure_contains": _match_failure_contains,
+}
+
+
+def _filter_available_refs(refs: list[str], evidence: EvidenceInput) -> list[str]:
+    return [ref for ref in refs if _ref_available(ref, evidence)]
+
+
+def _ref_available(ref: str, evidence: EvidenceInput) -> bool:
+    top = ref.split(".", 1)[0].split("[", 1)[0]
+    if top == "top_functions":
+        return bool(evidence.top_functions)
+    if top == "ebpf_metrics":
+        return bool(evidence.ebpf_metrics)
+    if top == "baseline_diff":
+        return bool(evidence.baseline_diff)
+    if top == "agent_stats":
+        return bool(evidence.agent_stats)
+    if top == "suggestions":
+        return bool(evidence.suggestions)
+    if top == "failure_events":
+        return bool(evidence.failure_events)
+    if top == "task_metadata":
+        sub = ref.split(".", 1)[1] if "." in ref else ""
+        return bool(evidence.task_metadata.get(sub)) if sub else bool(evidence.task_metadata)
+    if top == "tool_results":
+        tool_name = ref.split(".", 1)[1] if "." in ref else ""
+        return any(item.get("tool_name") == tool_name for item in evidence.tool_results)
+    return False
 
 
 def _detect_missing_evidence(candidate_id: str, evidence: EvidenceInput) -> list[str]:
-    """检测当前证据中缺失的关键数据。"""
     missing: list[str] = []
-    checks: dict[str, list[str]] = {
-        "cpu_hotspot_recursive": [],
-        "io_wait_high": [],
-        "python_userland_hotspot": [],
-        "agent_overhead": [],
-    }
-
-    for check in checks.get(candidate_id, []):
-        if check == "baseline" and not evidence.baseline_diff:
-            missing.append("缺少历史基线对比数据")
-
     if not evidence.top_functions and candidate_id in ("cpu_hotspot_recursive", "python_userland_hotspot"):
         missing.append("缺少 TopN 热点函数数据")
-
     if not evidence.ebpf_metrics and candidate_id == "io_wait_high":
         missing.append("缺少 eBPF IO 延迟分布数据")
-
+    if not evidence.baseline_diff and candidate_id in ("cpu_hotspot_recursive", "io_wait_high"):
+        missing.append("缺少历史基线对比数据")
     return missing

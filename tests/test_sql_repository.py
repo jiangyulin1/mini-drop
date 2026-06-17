@@ -224,3 +224,65 @@ class TestAuditPersistence:
         logs = repo2.audit_logs
         assert len(logs) >= 1
         assert any(l.event_type == "TASK_CREATED" for l in logs)
+
+
+class TestRCAPersistence:
+    """智能归因结果、工具证据和反馈权重持久化。"""
+
+    def test_diagnosis_roundtrip(self, repo: SqlRepository):
+        repo.register_agent("rca_agent", "h", "10.0.6.1")
+        task = repo.create_task(CreateTaskRequest(
+            name="rca-task", agent_id="rca_agent",
+            target_pid=1, collector_type="perf_cpu",
+        ))
+        diagnosis_id = repo.create_diagnosis_run(task.id, "rule-engine-only")
+        repo.add_diagnosis_tool_result(
+            diagnosis_id=diagnosis_id,
+            tool_name="inspect_task_events",
+            status="success",
+            evidence_ref="tool_results.inspect_task_events",
+            input_json={},
+            output_json={"events": [{"created_at": now_utc()}]},
+        )
+        report_id = repo.add_diagnosis_report(
+            diagnosis_id=diagnosis_id,
+            report_json={"summary": "ok"},
+            ranked_causes=[{"cause_id": "cpu_hotspot_recursive", "confidence": 0.7}],
+            confidence=0.7,
+            not_enough_evidence=False,
+        )
+        repo.add_repair_plan(
+            diagnosis_id=diagnosis_id,
+            plan_id="repair_test",
+            cause_id="cpu_hotspot_recursive",
+            risk_level="manual_only",
+            actions=[{"action_id": "a1"}],
+            executed_actions=[],
+            requires_user_confirm=True,
+            status="planned",
+        )
+        repo.finish_diagnosis_run(diagnosis_id, "DONE", "ok", True, 0)
+
+        item = repo.get_diagnosis(diagnosis_id)
+        assert item is not None
+        assert item["run"]["status"] == "DONE"
+        assert item["report"]["id"] == report_id
+        assert item["tool_results"][0]["tool_name"] == "inspect_task_events"
+        assert item["repair_plan"]["id"] == "repair_test"
+
+    def test_feedback_updates_prior(self, repo: SqlRepository):
+        repo.register_agent("feedback_agent", "h", "10.0.6.2")
+        task = repo.create_task(CreateTaskRequest(
+            name="feedback-task", agent_id="feedback_agent",
+            target_pid=1, collector_type="perf_cpu",
+        ))
+        diagnosis_id = repo.create_diagnosis_run(task.id, "rule-engine-only")
+        repo.record_rca_feedback(
+            diagnosis_id=diagnosis_id,
+            task_id=task.id,
+            predicted_cause_id="cpu_hotspot_recursive",
+            feedback_label="correct",
+        )
+        priors = repo.get_feedback_priors()
+        assert priors["cpu_hotspot_recursive"].positive_count == 1
+        assert priors["cpu_hotspot_recursive"].weight_delta > 0

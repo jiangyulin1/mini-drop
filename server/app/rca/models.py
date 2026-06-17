@@ -24,6 +24,7 @@ class EvidenceInput(BaseModel):
     ebpf_metrics: Optional[dict] = None
     baseline_diff: Optional[dict] = None
     agent_stats: Optional[dict] = None
+    tool_results: list[dict] = Field(default_factory=list)
     suggestions: list[str] = Field(default_factory=list)
     failure_events: list[str] = Field(default_factory=list)
 
@@ -101,6 +102,50 @@ class ValidatedReport(BaseModel):
     validated: bool = True
     validation_issues: list[str] = Field(default_factory=list)
     retry_count: int = 0
+
+
+class ToolResult(BaseModel):
+    """一次 RCA 工具调用结果，作为可引用证据链的一部分。"""
+
+    tool_name: str
+    status: str
+    evidence_ref: str
+    input: dict[str, Any] = Field(default_factory=dict)
+    output: dict[str, Any] = Field(default_factory=dict)
+    error_message: Optional[str] = None
+
+
+class RepairAction(BaseModel):
+    """单个修复动作。safe_auto 可自动执行，其余只生成建议。"""
+
+    action_id: str
+    action_type: str
+    risk_level: str
+    description: str
+    command: Optional[str] = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+    status: str = "planned"
+    result: Optional[str] = None
+
+
+class RepairPlan(BaseModel):
+    """诊断后的修复计划。"""
+
+    plan_id: str
+    task_id: str
+    cause_id: str
+    risk_level: str
+    actions: list[RepairAction] = Field(default_factory=list)
+    requires_user_confirm: bool = True
+    status: str = "planned"
+
+
+class DiagnosisOutcome(BaseModel):
+    """一次完整诊断的工程化输出。"""
+
+    report: ValidatedReport
+    tool_results: list[ToolResult] = Field(default_factory=list)
+    repair_plan: Optional[RepairPlan] = None
 
 
 class RCAFeedback(BaseModel):

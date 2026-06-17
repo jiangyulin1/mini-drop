@@ -10,20 +10,22 @@ from unittest import mock
 import pytest
 
 from server.app.rca.calibrator import calibrate, interpret_confidence
-from server.app.rca.candidates import generate_candidates
+from server.app.rca.candidates import generate_candidates, load_rules
 from server.app.rca.evidence import collect_evidence, evidence_to_json
 from server.app.rca.llm_client import _extract_json, _validate_and_parse, _ref_exists, _collect_evidence_paths
-from server.app.rca.models import CandidateCause, DiagnosisReport, EvidenceInput, FeedbackPrior
+from server.app.rca.models import CandidateCause, CauseEntry, DiagnosisReport, EvidenceInput, FeedbackPrior
 from server.app.rca.prompt import build_system_prompt, build_user_message
-from server.app.rca.report import run_diagnosis
+from server.app.rca.report import run_diagnosis, run_diagnosis_context
+from server.app.rca.tools import run_rca_tools
 
 
 # ── 模拟 Task Record ──
 
 
-class _FakeTask:
+class _StubTask:
     def __init__(self):
         self.id = "task_test"
+        self.agent_id = "agent_test"
         self.collector_type = "perf_cpu"
         self.target_pid = 1234
         self.duration_sec = 15
@@ -39,7 +41,7 @@ class TestEvidenceCollection:
     """证据采集层。"""
 
     def test_collects_all_fields(self):
-        task = _FakeTask()
+        task = _StubTask()
         ev = collect_evidence(
             task_id=task.id, task_record=task,
             top_functions=[{"name": "fib", "samples": 100, "percent": 68.0}],
@@ -57,7 +59,7 @@ class TestEvidenceCollection:
         assert ev.baseline_diff is not None
 
     def test_evidence_json_is_valid(self):
-        task = _FakeTask()
+        task = _StubTask()
         ev = collect_evidence(task_id="t1", task_record=task,
                               top_functions=[{"name": "f", "samples": 1, "percent": 100.0}])
         text = evidence_to_json(ev)
@@ -68,7 +70,7 @@ class TestEvidenceCollection:
     def test_fields_ordered_by_recency(self):
         """top_functions 应出现在 ebpf_metrics 之前（证据按重要性排序，
         越重要越靠后 → 近因效应）。实际输出中重要字段放在后面。"""
-        task = _FakeTask()
+        task = _StubTask()
         ev = collect_evidence(task_id="t1", task_record=task,
                               top_functions=[{"name": "f", "samples": 1, "percent": 50.0}],
                               ebpf_metrics={"latency": {}})
@@ -85,8 +87,14 @@ class TestEvidenceCollection:
 class TestCandidateGeneration:
     """规则引擎。"""
 
+    def test_rules_loaded_from_external_file(self):
+        load_rules.cache_clear()
+        rules = load_rules()
+        assert any(rule["candidate_id"] == "cpu_hotspot_recursive" for rule in rules)
+        assert all("match_type" in rule for rule in rules)
+
     def test_cpu_hotspot_matched(self):
-        task = _FakeTask()
+        task = _StubTask()
         ev = collect_evidence(task_id="t1", task_record=task,
                               top_functions=[{"name": "fib_hotspot", "samples": 100, "percent": 68.5}])
         candidates = generate_candidates(ev)
@@ -94,7 +102,7 @@ class TestCandidateGeneration:
         assert "cpu_hotspot_recursive" in ids
 
     def test_io_wait_matched_from_ebpf(self):
-        task = _FakeTask()
+        task = _StubTask()
         task.collector_type = "ebpf_io"
         ev = collect_evidence(task_id="t1", task_record=task,
                               ebpf_metrics={"io_latency_us": {"[128,256)": 10}})
@@ -102,14 +110,14 @@ class TestCandidateGeneration:
         assert any(c.candidate_id == "io_wait_high" for c in candidates)
 
     def test_no_rules_fallback(self):
-        task = _FakeTask()
+        task = _StubTask()
         ev = collect_evidence(task_id="t1", task_record=task)
         candidates = generate_candidates(ev)
         assert len(candidates) == 1
         assert candidates[0].candidate_id == "insufficient_data"
 
     def test_target_pid_invalid_matched(self):
-        task = _FakeTask()
+        task = _StubTask()
         task.status = "FAILED"
         ev = collect_evidence(task_id="t1", task_record=task,
                               failure_events=["目标 PID 不存在"])
@@ -117,7 +125,7 @@ class TestCandidateGeneration:
         assert any(c.candidate_id == "target_pid_invalid" for c in candidates)
 
     def test_feedback_prior_adjusts_score(self):
-        task = _FakeTask()
+        task = _StubTask()
         ev = collect_evidence(task_id="t1", task_record=task,
                               top_functions=[{"name": "fib_hotspot", "samples": 100, "percent": 68.5}])
         candidates_no_prior = generate_candidates(ev)
@@ -314,6 +322,75 @@ class TestValidationAndParsing:
         assert _ref_exists("top_functions", paths) is True
         assert _ref_exists("nonexistent", paths) is False
 
+    def test_tool_result_ref_is_valid(self):
+        evidence = EvidenceInput(
+            tool_results=[{
+                "tool_name": "get_flamegraph_top",
+                "status": "success",
+                "evidence_ref": "tool_results.get_flamegraph_top",
+                "output": {},
+            }]
+        )
+        raw = json.dumps({
+            "summary": "tool evidence",
+            "ranked_causes": [{
+                "cause_id": "cpu_hotspot_recursive",
+                "confidence": 0.7,
+                "claim": "hotspot",
+                "evidence_refs": ["tool_results.get_flamegraph_top"],
+                "uncertainties": [],
+                "verification_steps": [],
+            }],
+            "facts": ["tool ok"],
+            "not_enough_evidence": False,
+        })
+        report, issues = _validate_and_parse(raw, evidence)
+        assert report is not None
+        assert issues == []
+
+
+# ── 工具证据与修复计划 ──
+
+
+class _StubRepo:
+    def __init__(self):
+        self.created_payloads = []
+
+    def create_task(self, payload):
+        self.created_payloads.append(payload)
+
+        class _Task:
+            id = "task_followup"
+
+        return _Task()
+
+
+class TestToolAndRepairFlow:
+    """工具证据链和 safe_auto 修复动作。"""
+
+    def test_tool_results_are_structured_evidence(self):
+        tools = run_rca_tools(
+            task_record=_StubTask(),
+            top_functions=[{"name": "fib_hotspot", "samples": 100, "percent": 68.5}],
+        )
+        flame_tool = next(item for item in tools if item.tool_name == "get_flamegraph_top")
+        assert flame_tool.status == "success"
+        assert flame_tool.evidence_ref == "tool_results.get_flamegraph_top"
+
+    def test_context_builds_and_executes_safe_followup(self):
+        stub_repo = _StubRepo()
+        with mock.patch.dict("os.environ", {}, clear=True):
+            outcome = run_diagnosis_context(
+                task_id="task_test",
+                task_record=_StubTask(),
+                top_functions=[{"name": "fib_hotspot", "samples": 100, "percent": 68.5}],
+                repo=stub_repo,
+            )
+        assert outcome.report.report.ranked_causes[0].cause_id == "cpu_hotspot_recursive"
+        assert outcome.repair_plan is not None
+        assert outcome.repair_plan.status == "safe_actions_executed"
+        assert stub_repo.created_payloads[0].collector_type == "pyspy"
+
 
 # ── 自修复重试 ──
 
@@ -352,8 +429,8 @@ class TestSelfRepair:
             "choices": [{"message": {"content": good_json}}]
         }
 
-        with mock.patch.dict("os.environ", {"DEEPSEEK_API_KEY": "fake-key"}):
-            with mock.patch("requests.post", side_effect=[mock_resp_bad, mock_resp_good]):
+        with mock.patch.dict("os.environ", {"DEEPSEEK_API_KEY": "test-key"}):
+            with mock.patch("server.app.rca.llm_client._post_json", side_effect=[mock_resp_bad, mock_resp_good]):
                 from server.app.rca.llm_client import diagnose
                 result = diagnose(
                     task_id="t1",
@@ -373,8 +450,8 @@ class TestSelfRepair:
             "choices": [{"message": {"content": bad_json}}]
         }
 
-        with mock.patch.dict("os.environ", {"DEEPSEEK_API_KEY": "fake-key"}):
-            with mock.patch("requests.post", return_value=mock_resp):
+        with mock.patch.dict("os.environ", {"DEEPSEEK_API_KEY": "test-key"}):
+            with mock.patch("server.app.rca.llm_client._post_json", return_value=mock_resp):
                 from server.app.rca.llm_client import diagnose
                 result = diagnose(
                     task_id="t1",
@@ -400,7 +477,7 @@ class TestFallback:
             assert result.report.not_enough_evidence is True
 
     def test_run_diagnosis_with_no_key(self):
-        task = _FakeTask()
+        task = _StubTask()
         with mock.patch.dict("os.environ", {}, clear=True):
             result = run_diagnosis(task_id="t1", task_record=task,
                                    top_functions=[{"name": "fib", "samples": 100, "percent": 68.5}])

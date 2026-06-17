@@ -22,6 +22,7 @@ from server.app.state_machine import Actor, TaskStatus
 def _reset_repo(monkeypatch):
     """每个测试使用独立 SQLite 内存库，确保用例间无状态交叉。"""
     monkeypatch.setenv("DATABASE_URL", "sqlite:///:memory:")
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     reset_engine()
     init_db()
     repo._task_queues.clear()
@@ -246,12 +247,36 @@ class TestDiagnose:
         })
         task_id = resp.json()["data"]["task_id"]
         diag = client.post(f"/api/tasks/{task_id}/diagnose").json()["data"]
-        assert diag["report_id"].startswith("diag_")
+        assert diag["diagnosis_id"].startswith("diag_")
+        assert diag["report_id"].startswith("report_")
         assert diag["task_id"] == task_id
         assert "summary" in diag
         assert "ranked_causes" in diag
         assert "model" in diag
+        assert len(diag["tool_results"]) >= 1
+        assert diag["repair_plan"]["plan_id"].startswith("repair_")
+
+        detail = client.get(f"/api/diagnoses/{diag['diagnosis_id']}").json()["data"]
+        assert detail["run"]["task_id"] == task_id
+        assert len(detail["tool_results"]) >= 1
+        history = client.get(f"/api/tasks/{task_id}/diagnoses").json()["data"]
+        assert history[0]["id"] == diag["diagnosis_id"]
+
+        feedback = client.post(
+            f"/api/diagnoses/{diag['diagnosis_id']}/feedback",
+            json={
+                "predicted_cause_id": "insufficient_data",
+                "feedback_label": "partial",
+                "feedback_note": "需要更多证据",
+            },
+        )
+        assert feedback.status_code == 200
+        assert feedback.json()["data"]["feedback_saved"] is True
 
     def test_diagnose_404_for_nonexistent(self, client: TestClient):
         resp = client.post("/api/tasks/nope/diagnose")
+        assert resp.status_code == 404
+
+    def test_diagnosis_detail_404_for_nonexistent(self, client: TestClient):
+        resp = client.get("/api/diagnoses/diag_missing")
         assert resp.status_code == 404

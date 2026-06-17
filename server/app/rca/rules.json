@@ -1,0 +1,64 @@
+[
+  {
+    "candidate_id": "cpu_hotspot_recursive",
+    "description": "单一计算函数占 CPU 采样数比例过高，可能存在递归或密集型计算瓶颈",
+    "match_type": "top_function_keyword",
+    "params": {
+      "min_percent": 40,
+      "keywords": ["fib", "recursive", "loop", "compute", "hotspot"]
+    },
+    "rule_score": 0.83,
+    "evidence_refs": ["top_functions[0]", "tool_results.get_flamegraph_top", "baseline_diff"]
+  },
+  {
+    "candidate_id": "io_wait_high",
+    "description": "块设备 IO 延迟异常，可能是磁盘带宽或 IOPS 达到上限",
+    "match_type": "ebpf_latency_present",
+    "params": {},
+    "rule_score": 0.78,
+    "evidence_refs": ["ebpf_metrics.io_latency_us", "tool_results.get_ebpf_latency_summary", "baseline_diff"]
+  },
+  {
+    "candidate_id": "python_userland_hotspot",
+    "description": "Python 用户态函数热点，与 perf 系统级热点一致，根因在应用层",
+    "match_type": "collector_or_suggestion",
+    "params": {
+      "collector_type": "pyspy",
+      "suggestion_keyword": "python"
+    },
+    "rule_score": 0.72,
+    "evidence_refs": ["top_functions", "tool_results.get_flamegraph_top", "suggestions"]
+  },
+  {
+    "candidate_id": "agent_overhead",
+    "description": "采集 Agent 自身资源开销过高，可能影响目标进程性能",
+    "match_type": "agent_cpu_overhead",
+    "params": {
+      "min_cpu_percent": 10
+    },
+    "rule_score": 0.55,
+    "evidence_refs": ["agent_stats", "tool_results.check_agent_health"]
+  },
+  {
+    "candidate_id": "collector_permission_denied",
+    "description": "采集权限不足导致采集失败或结果异常",
+    "match_type": "failure_contains",
+    "params": {
+      "status": "FAILED",
+      "keywords": ["permission", "权限"]
+    },
+    "rule_score": 0.9,
+    "evidence_refs": ["failure_events", "task_metadata.status", "tool_results.inspect_task_events"]
+  },
+  {
+    "candidate_id": "target_pid_invalid",
+    "description": "目标 PID 不存在或在采集期间退出",
+    "match_type": "failure_contains",
+    "params": {
+      "status": "FAILED",
+      "keywords": ["不存在", "exited", "not found"]
+    },
+    "rule_score": 0.95,
+    "evidence_refs": ["failure_events", "task_metadata.target_pid", "tool_results.inspect_task_events"]
+  }
+]

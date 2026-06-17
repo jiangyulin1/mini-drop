@@ -17,10 +17,11 @@ from fastapi import FastAPI, HTTPException
 
 from server.app.database import init_db
 from server.app.grpc_server import serve_in_background
-from server.app.rca.report import run_diagnosis
+from server.app.rca.report import run_diagnosis_context
 from server.app.schemas import (
     APIResponse,
     CreateTaskRequest,
+    RCAFeedbackRequest,
     TaskView,
 )
 from server.app.sql_repository import SqlRepository
@@ -168,23 +169,115 @@ def diagnose_task(task_id: str) -> APIResponse:
     top_functions = _extract_artifact_json(artifacts, "top_json")
     ebpf_metrics = _extract_artifact_json(artifacts, "ebpf_metrics")
 
-    report = run_diagnosis(
+    task_events = [repo.as_dict(e) for e in repo.events if e.task_id == task_id]
+    agent_record = repo.agents.get(task.agent_id)
+    model_name = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+    diagnosis_id = repo.create_diagnosis_run(task_id, model_name)
+
+    outcome = run_diagnosis_context(
         task_id=task_id,
         task_record=task,
         top_functions=top_functions,
         ebpf_metrics=ebpf_metrics,
+        failure_events=[event.get("reason", "") for event in task_events if event.get("reason")],
+        feedback_priors=repo.get_feedback_priors(),
+        task_events=task_events,
+        agent_record=agent_record,
+        repo=repo,
+    )
+    report = outcome.report
+    ranked_causes = [c.model_dump() for c in report.report.ranked_causes]
+    confidence = ranked_causes[0]["confidence"] if ranked_causes else 0.0
+
+    for tool_result in outcome.tool_results:
+        repo.add_diagnosis_tool_result(
+            diagnosis_id=diagnosis_id,
+            tool_name=tool_result.tool_name,
+            status=tool_result.status,
+            evidence_ref=tool_result.evidence_ref,
+            input_json=tool_result.input,
+            output_json=tool_result.output,
+            error_message=tool_result.error_message,
+        )
+
+    report_id = repo.add_diagnosis_report(
+        diagnosis_id=diagnosis_id,
+        report_json=report.report.model_dump(),
+        ranked_causes=ranked_causes,
+        confidence=confidence,
+        not_enough_evidence=report.report.not_enough_evidence,
+    )
+
+    repair_plan_data = None
+    if outcome.repair_plan is not None:
+        repair_plan_data = outcome.repair_plan.model_dump()
+        repo.add_repair_plan(
+            diagnosis_id=diagnosis_id,
+            plan_id=outcome.repair_plan.plan_id,
+            cause_id=outcome.repair_plan.cause_id,
+            risk_level=outcome.repair_plan.risk_level,
+            actions=[action.model_dump() for action in outcome.repair_plan.actions],
+            executed_actions=[
+                action.model_dump() for action in outcome.repair_plan.actions
+                if action.status == "executed"
+            ],
+            requires_user_confirm=outcome.repair_plan.requires_user_confirm,
+            status=outcome.repair_plan.status,
+        )
+
+    repo.finish_diagnosis_run(
+        diagnosis_id=diagnosis_id,
+        status="DONE" if report.validated else "FAILED",
+        summary=report.report.summary,
+        validated=report.validated,
+        retry_count=report.retry_count,
     )
 
     return APIResponse(data={
-        "report_id": f"diag_{task_id}",
+        "diagnosis_id": diagnosis_id,
+        "report_id": report_id,
         "task_id": task_id,
         "model": report.model_name,
         "validated": report.validated,
         "summary": report.report.summary,
-        "ranked_causes": [c.model_dump() for c in report.report.ranked_causes],
+        "ranked_causes": ranked_causes,
         "facts": report.report.facts,
         "not_enough_evidence": report.report.not_enough_evidence,
+        "tool_results": [item.model_dump() for item in outcome.tool_results],
+        "repair_plan": repair_plan_data,
     })
+
+
+@app.get("/api/tasks/{task_id}/diagnoses")
+def list_task_diagnoses(task_id: str) -> APIResponse:
+    if task_id not in repo.tasks:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return APIResponse(data=repo.list_diagnoses_for_task(task_id))
+
+
+@app.get("/api/diagnoses/{diagnosis_id}")
+def get_diagnosis(diagnosis_id: str) -> APIResponse:
+    item = repo.get_diagnosis(diagnosis_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="诊断不存在")
+    return APIResponse(data=item)
+
+
+@app.post("/api/diagnoses/{diagnosis_id}/feedback")
+def submit_diagnosis_feedback(diagnosis_id: str, payload: RCAFeedbackRequest) -> APIResponse:
+    item = repo.get_diagnosis(diagnosis_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="诊断不存在")
+    task_id = item["run"]["task_id"]
+    repo.record_rca_feedback(
+        diagnosis_id=diagnosis_id,
+        task_id=task_id,
+        predicted_cause_id=payload.predicted_cause_id,
+        feedback_label=payload.feedback_label,
+        corrected_cause_id=payload.corrected_cause_id,
+        feedback_note=payload.feedback_note,
+    )
+    return APIResponse(data={"diagnosis_id": diagnosis_id, "feedback_saved": True})
 
 
 def _extract_artifact_json(artifacts: list[dict], artifact_type: str) -> dict | None:

@@ -65,3 +65,15 @@ export function getTaskArtifacts(taskId) {
 export function triggerDiagnose(taskId) {
   return api.post(`/tasks/${taskId}/diagnose`);
 }
+
+export function listTaskDiagnoses(taskId) {
+  return api.get(`/tasks/${taskId}/diagnoses`);
+}
+
+export function getDiagnosis(diagnosisId) {
+  return api.get(`/diagnoses/${diagnosisId}`);
+}
+
+export function submitDiagnosisFeedback(diagnosisId, payload) {
+  return api.post(`/diagnoses/${diagnosisId}/feedback`, payload);
+}

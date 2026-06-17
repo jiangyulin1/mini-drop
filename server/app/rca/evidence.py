@@ -19,6 +19,7 @@ def collect_evidence(
     failure_events: list[str] | None = None,
     baseline_diff: dict | None = None,
     agent_stats: dict | None = None,
+    tool_results: list[dict] | None = None,
 ) -> EvidenceInput:
     """从各数据源汇总结构化证据。
 
@@ -42,6 +43,7 @@ def collect_evidence(
         task_metadata={
             "task_id": task_id,
             "collector_type": getattr(task_record, "collector_type", "unknown") if task_record else "unknown",
+            "agent_id": getattr(task_record, "agent_id", None) if task_record else None,
             "target_pid": getattr(task_record, "target_pid", None) if task_record else None,
             "duration_sec": getattr(task_record, "duration_sec", 0) if task_record else 0,
             "sample_rate": getattr(task_record, "sample_rate", 0) if task_record else 0,
@@ -52,6 +54,7 @@ def collect_evidence(
         ebpf_metrics=ebpf_metrics,
         baseline_diff=baseline_diff,
         agent_stats=agent_stats or {},
+        tool_results=tool_results or [],
         suggestions=suggestions or [],
         failure_events=failure_events or [],
     )
@@ -78,10 +81,13 @@ def evidence_to_json(evidence: EvidenceInput) -> str:
     if evidence.agent_stats:
         parts["agent_stats"] = evidence.agent_stats
 
+    if evidence.tool_results:
+        parts["tool_results"] = evidence.tool_results
+
     if evidence.suggestions:
         parts["suggestions"] = evidence.suggestions[:5]
 
     if evidence.failure_events:
         parts["failure_events"] = evidence.failure_events[-3:]  # 最近 3 条
 
-    return json.dumps(parts, indent=2, ensure_ascii=False)
+    return json.dumps(parts, indent=2, ensure_ascii=False, default=str)

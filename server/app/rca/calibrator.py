@@ -132,11 +132,16 @@ def _score_cross_collector_agreement(c: CandidateCause, ev: EvidenceInput) -> fl
     has_perf = ev.top_functions is not None and len(ev.top_functions) > 0
     has_ebpf = ev.ebpf_metrics is not None
     has_suggestions = len(ev.suggestions) > 0
+    successful_tools = {
+        item.get("tool_name") for item in ev.tool_results
+        if item.get("status") == "success"
+    }
+    has_tool_support = bool(successful_tools)
 
-    if not has_perf:
+    if not has_perf and not has_tool_support:
         return 0.3
 
-    evidence_count = sum([has_perf, has_ebpf, has_suggestions])
+    evidence_count = sum([has_perf, has_ebpf, has_suggestions, has_tool_support])
     if evidence_count >= 3:
         return 0.85
     if evidence_count >= 2:

@@ -10,8 +10,6 @@ import os
 import re
 import time
 
-import requests
-
 from server.app.rca.models import CauseEntry, DiagnosisReport, EvidenceInput, ValidatedReport
 from server.app.rca.prompt import build_system_prompt, build_user_message
 
@@ -49,7 +47,7 @@ def diagnose(
     user_message = build_user_message(evidence_json, candidates_json)
 
     if not _get_api_key():
-        return _fallback_report(task_id, evidence)
+        return _fallback_report(task_id, evidence, candidates_json)
 
     messages = [
         {"role": "system", "content": system_prompt},
@@ -125,7 +123,7 @@ def _call_deepseek(messages: list[dict], model: str) -> str:
     Raises:
         RuntimeError: API 返回非 200。
     """
-    resp = requests.post(
+    resp = _post_json(
         f"{API_BASE}/v1/chat/completions",
         headers={
             "Authorization": f"Bearer {_get_api_key()}",
@@ -147,6 +145,11 @@ def _call_deepseek(messages: list[dict], model: str) -> str:
     body = resp.json()
     content = body["choices"][0]["message"]["content"]
     return content
+
+
+def _post_json(url: str, headers: dict, json: dict, timeout: int):
+    import requests
+    return requests.post(url, headers=headers, json=json, timeout=timeout)
 
 
 def _validate_and_parse(raw: str, evidence: EvidenceInput) -> tuple[DiagnosisReport | None, list[str]]:
@@ -245,6 +248,13 @@ def _collect_evidence_paths(evidence: EvidenceInput) -> dict[str, set[str]]:
     if evidence.task_metadata:
         paths["task_metadata"] = set(evidence.task_metadata.keys())
 
+    if evidence.tool_results:
+        paths["tool_results"] = {
+            item.get("tool_name", "")
+            for item in evidence.tool_results
+            if item.get("tool_name")
+        }
+
     return paths
 
 
@@ -272,18 +282,37 @@ def _ref_exists(ref: str, valid_paths: dict[str, set[str]]) -> bool:
     return True
 
 
-def _fallback_report(task_id: str, evidence: EvidenceInput) -> ValidatedReport:
+def _fallback_report(task_id: str, evidence: EvidenceInput, candidates_json: str = "[]") -> ValidatedReport:
     """API Key 未配置时的降级报告（纯规则引擎输出）。"""
+    ranked: list[CauseEntry] = []
+    try:
+        candidates = json.loads(candidates_json)
+    except json.JSONDecodeError:
+        candidates = []
+
+    for item in candidates[:3]:
+        confidence = float(item.get("final_confidence", 0.0))
+        if item.get("candidate_id") == "insufficient_data":
+            continue
+        ranked.append(CauseEntry(
+            cause_id=item.get("candidate_id", "unknown"),
+            confidence=confidence,
+            claim=item.get("description", "规则引擎候选归因"),
+            evidence_refs=item.get("evidence_refs", []),
+            uncertainties=item.get("missing_evidence", []),
+            verification_steps=["补充采集或对比 baseline 后复核该结论"],
+        ))
+
+    not_enough = len(ranked) == 0
     return ValidatedReport(
         task_id=task_id,
         model_name="rule-engine-only",
         evidence_snapshot=evidence.model_dump() if isinstance(evidence, EvidenceInput) else {},
         report=DiagnosisReport(
-            summary="未配置 DEEPSEEK_API_KEY，归因引擎降级为纯规则匹配模式。"
-                    "请设置环境变量以启用 AI 增强归因。",
-            ranked_causes=[],
+            summary="未配置 DEEPSEEK_API_KEY，归因引擎使用规则候选与工具证据生成降级报告。",
+            ranked_causes=ranked,
             facts=evidence.suggestions if evidence.suggestions else ["无规则命中"],
-            not_enough_evidence=True,
+            not_enough_evidence=not_enough,
         ),
         validated=True,
     )

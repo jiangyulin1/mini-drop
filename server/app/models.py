@@ -169,3 +169,132 @@ class ArtifactModel(Base):
             "size_bytes": self.size_bytes,
             "metadata": self.meta_json or {},
         }
+
+
+# ── 智能归因 ───────────────────────────────────────────────────
+
+
+class DiagnosisRunModel(Base):
+    __tablename__ = "diagnosis_runs"
+
+    id = Column(String(128), primary_key=True)
+    task_id = Column(String(128), ForeignKey("tasks.id"), nullable=False, index=True)
+    status = Column(String(32), nullable=False)
+    model_name = Column(String(64), nullable=False)
+    summary = Column(Text, default="")
+    validated = Column(Integer, default=0)
+    retry_count = Column(Integer, default=0)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+    finished_at = Column(DateTime(timezone=True), nullable=True)
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "task_id": self.task_id,
+            "status": self.status,
+            "model_name": self.model_name,
+            "summary": self.summary or "",
+            "validated": bool(self.validated),
+            "retry_count": self.retry_count,
+            "created_at": self.created_at,
+            "finished_at": self.finished_at,
+        }
+
+
+class DiagnosisToolResultModel(Base):
+    __tablename__ = "diagnosis_tool_results"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    diagnosis_id = Column(String(128), ForeignKey("diagnosis_runs.id"), nullable=False, index=True)
+    tool_name = Column(String(64), nullable=False)
+    status = Column(String(32), nullable=False)
+    evidence_ref = Column(String(128), nullable=False)
+    input_json = Column(JSON, default=dict)
+    output_json = Column(JSON, default=dict)
+    error_message = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+
+    def to_dict(self) -> dict:
+        return {
+            "tool_name": self.tool_name,
+            "status": self.status,
+            "evidence_ref": self.evidence_ref,
+            "input": self.input_json or {},
+            "output": self.output_json or {},
+            "error_message": self.error_message,
+            "created_at": self.created_at,
+        }
+
+
+class DiagnosisReportModel(Base):
+    __tablename__ = "diagnosis_reports"
+
+    id = Column(String(128), primary_key=True)
+    diagnosis_id = Column(String(128), ForeignKey("diagnosis_runs.id"), nullable=False, index=True)
+    report_json = Column(JSON, default=dict)
+    ranked_causes_json = Column(JSON, default=list)
+    confidence = Column(Integer, default=0)
+    not_enough_evidence = Column(Integer, default=0)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "diagnosis_id": self.diagnosis_id,
+            "report": self.report_json or {},
+            "ranked_causes": self.ranked_causes_json or [],
+            "confidence": (self.confidence or 0) / 1000,
+            "not_enough_evidence": bool(self.not_enough_evidence),
+            "created_at": self.created_at,
+        }
+
+
+class RepairPlanModel(Base):
+    __tablename__ = "repair_plans"
+
+    id = Column(String(128), primary_key=True)
+    diagnosis_id = Column(String(128), ForeignKey("diagnosis_runs.id"), nullable=False, index=True)
+    cause_id = Column(String(128), nullable=False)
+    risk_level = Column(String(32), nullable=False)
+    actions_json = Column(JSON, default=list)
+    executed_actions_json = Column(JSON, default=list)
+    requires_user_confirm = Column(Integer, default=1)
+    status = Column(String(32), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "diagnosis_id": self.diagnosis_id,
+            "cause_id": self.cause_id,
+            "risk_level": self.risk_level,
+            "actions": self.actions_json or [],
+            "executed_actions": self.executed_actions_json or [],
+            "requires_user_confirm": bool(self.requires_user_confirm),
+            "status": self.status,
+            "created_at": self.created_at,
+        }
+
+
+class RCAFeedbackModel(Base):
+    __tablename__ = "rca_feedback"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    diagnosis_id = Column(String(128), ForeignKey("diagnosis_runs.id"), nullable=False, index=True)
+    task_id = Column(String(128), nullable=False, index=True)
+    predicted_cause_id = Column(String(128), nullable=False)
+    feedback_label = Column(String(32), nullable=False)
+    corrected_cause_id = Column(String(128), nullable=True)
+    feedback_note = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+
+
+class RCAFeedbackWeightModel(Base):
+    __tablename__ = "rca_feedback_weights"
+
+    candidate_id = Column(String(128), primary_key=True)
+    positive_count = Column(Integer, default=0)
+    negative_count = Column(Integer, default=0)
+    partial_count = Column(Integer, default=0)
+    weight_delta = Column(Integer, default=0)
+    updated_at = Column(DateTime(timezone=True), nullable=False)

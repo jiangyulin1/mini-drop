@@ -21,9 +21,16 @@ from server.app.models import (
     AgentModel,
     ArtifactModel,
     AuditLogModel,
+    DiagnosisReportModel,
+    DiagnosisRunModel,
+    DiagnosisToolResultModel,
+    RCAFeedbackModel,
+    RCAFeedbackWeightModel,
+    RepairPlanModel,
     StatusEventModel,
     TaskModel,
 )
+from server.app.rca.models import FeedbackPrior
 from server.app.schemas import CreateTaskRequest
 from server.app.state_machine import (
     Actor,
@@ -361,6 +368,242 @@ class SqlRepository:
             session.close()
 
     # ------------------------------------------------------------------
+    # RCA
+    # ------------------------------------------------------------------
+
+    def create_diagnosis_run(self, task_id: str, model_name: str) -> str:
+        with self._lock:
+            session = new_session()
+            try:
+                ts = now_utc()
+                diagnosis_id = f"diag_{ts.strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:6]}"
+                session.add(DiagnosisRunModel(
+                    id=diagnosis_id,
+                    task_id=task_id,
+                    status="RUNNING",
+                    model_name=model_name,
+                    created_at=ts,
+                ))
+                session.commit()
+                return diagnosis_id
+            except Exception:
+                session.rollback()
+                raise
+            finally:
+                session.close()
+
+    def finish_diagnosis_run(
+        self, diagnosis_id: str, status: str, summary: str,
+        validated: bool, retry_count: int,
+    ) -> None:
+        with self._lock:
+            session = new_session()
+            try:
+                run = session.get(DiagnosisRunModel, diagnosis_id)
+                if run is None:
+                    raise ValueError(f"诊断 {diagnosis_id} 不存在")
+                run.status = status
+                run.summary = summary
+                run.validated = 1 if validated else 0
+                run.retry_count = retry_count
+                run.finished_at = now_utc()
+                session.commit()
+            except Exception:
+                session.rollback()
+                raise
+            finally:
+                session.close()
+
+    def add_diagnosis_tool_result(
+        self, diagnosis_id: str, tool_name: str, status: str,
+        evidence_ref: str, input_json: dict[str, Any],
+        output_json: dict[str, Any], error_message: str | None = None,
+    ) -> None:
+        with self._lock:
+            session = new_session()
+            try:
+                session.add(DiagnosisToolResultModel(
+                    diagnosis_id=diagnosis_id,
+                    tool_name=tool_name,
+                    status=status,
+                    evidence_ref=evidence_ref,
+                    input_json=_json_safe(input_json),
+                    output_json=_json_safe(output_json),
+                    error_message=error_message,
+                    created_at=now_utc(),
+                ))
+                session.commit()
+            except Exception:
+                session.rollback()
+                raise
+            finally:
+                session.close()
+
+    def add_diagnosis_report(
+        self, diagnosis_id: str, report_json: dict[str, Any],
+        ranked_causes: list[dict[str, Any]], confidence: float,
+        not_enough_evidence: bool,
+    ) -> str:
+        with self._lock:
+            session = new_session()
+            try:
+                report_id = f"report_{uuid4().hex[:10]}"
+                session.add(DiagnosisReportModel(
+                    id=report_id,
+                    diagnosis_id=diagnosis_id,
+                    report_json=_json_safe(report_json),
+                    ranked_causes_json=_json_safe(ranked_causes),
+                    confidence=int(max(0.0, min(confidence, 1.0)) * 1000),
+                    not_enough_evidence=1 if not_enough_evidence else 0,
+                    created_at=now_utc(),
+                ))
+                session.commit()
+                return report_id
+            except Exception:
+                session.rollback()
+                raise
+            finally:
+                session.close()
+
+    def add_repair_plan(
+        self, diagnosis_id: str, plan_id: str, cause_id: str,
+        risk_level: str, actions: list[dict[str, Any]],
+        executed_actions: list[dict[str, Any]],
+        requires_user_confirm: bool, status: str,
+    ) -> None:
+        with self._lock:
+            session = new_session()
+            try:
+                session.add(RepairPlanModel(
+                    id=plan_id,
+                    diagnosis_id=diagnosis_id,
+                    cause_id=cause_id,
+                    risk_level=risk_level,
+                    actions_json=_json_safe(actions),
+                    executed_actions_json=_json_safe(executed_actions),
+                    requires_user_confirm=1 if requires_user_confirm else 0,
+                    status=status,
+                    created_at=now_utc(),
+                ))
+                session.commit()
+            except Exception:
+                session.rollback()
+                raise
+            finally:
+                session.close()
+
+    def get_diagnosis(self, diagnosis_id: str) -> dict[str, Any] | None:
+        session = new_session()
+        try:
+            run = session.get(DiagnosisRunModel, diagnosis_id)
+            if run is None:
+                return None
+            report = (
+                session.query(DiagnosisReportModel)
+                .filter(DiagnosisReportModel.diagnosis_id == diagnosis_id)
+                .order_by(DiagnosisReportModel.created_at.desc())
+                .first()
+            )
+            plan = (
+                session.query(RepairPlanModel)
+                .filter(RepairPlanModel.diagnosis_id == diagnosis_id)
+                .order_by(RepairPlanModel.created_at.desc())
+                .first()
+            )
+            tools = (
+                session.query(DiagnosisToolResultModel)
+                .filter(DiagnosisToolResultModel.diagnosis_id == diagnosis_id)
+                .order_by(DiagnosisToolResultModel.id.asc())
+                .all()
+            )
+            return {
+                "run": run.to_dict(),
+                "report": report.to_dict() if report else None,
+                "repair_plan": plan.to_dict() if plan else None,
+                "tool_results": [tool.to_dict() for tool in tools],
+            }
+        finally:
+            session.close()
+
+    def list_diagnoses_for_task(self, task_id: str) -> list[dict[str, Any]]:
+        session = new_session()
+        try:
+            runs = (
+                session.query(DiagnosisRunModel)
+                .filter(DiagnosisRunModel.task_id == task_id)
+                .order_by(DiagnosisRunModel.created_at.desc())
+                .all()
+            )
+            return [run.to_dict() for run in runs]
+        finally:
+            session.close()
+
+    def get_feedback_priors(self) -> dict[str, FeedbackPrior]:
+        session = new_session()
+        try:
+            priors: dict[str, FeedbackPrior] = {}
+            for row in session.query(RCAFeedbackWeightModel).all():
+                priors[row.candidate_id] = FeedbackPrior(
+                    candidate_id=row.candidate_id,
+                    positive_count=row.positive_count or 0,
+                    negative_count=row.negative_count or 0,
+                    weight_delta=(row.weight_delta or 0) / 1000,
+                )
+            return priors
+        finally:
+            session.close()
+
+    def record_rca_feedback(
+        self, diagnosis_id: str, task_id: str, predicted_cause_id: str,
+        feedback_label: str, corrected_cause_id: str | None = None,
+        feedback_note: str | None = None,
+    ) -> None:
+        with self._lock:
+            session = new_session()
+            try:
+                ts = now_utc()
+                session.add(RCAFeedbackModel(
+                    diagnosis_id=diagnosis_id,
+                    task_id=task_id,
+                    predicted_cause_id=predicted_cause_id,
+                    feedback_label=feedback_label,
+                    corrected_cause_id=corrected_cause_id,
+                    feedback_note=feedback_note,
+                    created_at=ts,
+                ))
+
+                candidate_id = corrected_cause_id if feedback_label == "wrong" and corrected_cause_id else predicted_cause_id
+                weight = session.get(RCAFeedbackWeightModel, candidate_id)
+                if weight is None:
+                    weight = RCAFeedbackWeightModel(
+                        candidate_id=candidate_id,
+                        positive_count=0,
+                        negative_count=0,
+                        partial_count=0,
+                        weight_delta=0,
+                        updated_at=ts,
+                    )
+                    session.add(weight)
+
+                if feedback_label == "correct":
+                    weight.positive_count += 1
+                elif feedback_label == "partial":
+                    weight.partial_count += 1
+                elif feedback_label == "wrong":
+                    weight.negative_count += 1
+
+                weight.weight_delta = _feedback_delta(
+                    weight.positive_count, weight.partial_count, weight.negative_count,
+                )
+                weight.updated_at = ts
+                session.commit()
+            except Exception:
+                session.rollback()
+                raise
+            finally:
+                session.close()
+
+    # ------------------------------------------------------------------
     # 内部辅助
     # ------------------------------------------------------------------
 
@@ -410,6 +653,19 @@ class SqlRepository:
             data["to_status"] = value.to_status.value
             data["actor"] = value.actor.value
             return data
-        if isinstance(value, (AgentModel, TaskModel, StatusEventModel, AuditLogModel, ArtifactModel)):
+        if isinstance(value, (
+            AgentModel, TaskModel, StatusEventModel, AuditLogModel, ArtifactModel,
+            DiagnosisRunModel, DiagnosisToolResultModel, DiagnosisReportModel,
+            RepairPlanModel,
+        )):
             return value.to_dict()
         return json.loads(json.dumps(value, default=str))
+
+
+def _feedback_delta(positive: int, partial: int, negative: int) -> int:
+    raw = positive * 60 + partial * 25 - negative * 80
+    return max(-200, min(200, raw))
+
+
+def _json_safe(value: Any):
+    return json.loads(json.dumps(value, default=str))
