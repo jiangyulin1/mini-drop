@@ -48,11 +48,38 @@ Web (React + Ant Design + d3-flame-graph + ECharts)
 
 ## 开发
 
+项目提供两套命令入口，等价可互换：
+
 ```bash
-python3 -m venv .venv && source .venv/bin/activate
+# 入口 A：Makefile（Linux / macOS / Git Bash）
+make proto
+make server
+make agent
+make test
+
+# 入口 B：dev.py（跨平台，Windows cmd / PowerShell / Linux 均可用）
+python dev.py proto
+python dev.py server
+python dev.py agent
+python dev.py test
+python dev.py install
+```
+
+完整开发流程：
+
+```bash
+# 1. 安装依赖
 pip install -e ".[dev]"
-make test   # pytest
-make server # localhost:8191
+
+# 2. 编译 proto
+python dev.py proto
+
+# 3. 启动 Server + Agent（两个终端）
+python dev.py server      # 终端 1 → :8191 HTTP + :50051 gRPC
+python dev.py agent       # 终端 2 → 自动注册并心跳
+
+# 4. 运行测试
+python dev.py test
 ```
 
 ## 仓库结构
