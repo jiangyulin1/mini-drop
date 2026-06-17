@@ -66,6 +66,34 @@ micro-drop parse "mysqld CPU 飙高，帮我看看"
 micro-drop summarize --top-json /tmp/mini-drop/task/top.json
 micro-drop diagnose-local --evidence evidence.json
 micro-drop diff-top --base before/top.json --head after/top.json --threshold 5
+micro-drop ci-check --base before/top.json --head after/top.json --threshold 5
+micro-drop alert --top-json top.json --hotspot-threshold 70
+micro-drop batch-diagnose --dir evidence/
+micro-drop export-summary --top-json top.json --format markdown
+micro-drop keywords --kind collectors
+micro-drop suggest per --kind all
+micro-drop completion --shell bash
+```
+
+常用自动化场景：
+
+- `ci-check`：比较基线与当前 TopN，超过阈值返回非 0 退出码，适合性能回归门禁。
+- `alert`：按热点占比和样本数判断是否告警，返回 JSON 和退出码，适合脚本/监控系统接入。
+- `batch-diagnose`：批量读取证据 JSON，离线生成 RCA 结果，适合巡检和回放评测。
+- `export-summary`：把 TopN 导出为 JSON 或 Markdown，适合报告、工单和 ChatOps。
+- `keywords` / `suggest` / `completion`：提供命令、采集器、归因原因、证据字段字典，可用于 Shell 补全、脚本提示和专家查询。
+
+Shell 补全示例：
+
+```bash
+# Bash
+eval "$(micro-drop completion --shell bash)"
+
+# Zsh
+micro-drop completion --shell zsh > ~/.zfunc/_micro_drop
+
+# PowerShell
+micro-drop completion --shell powershell | Invoke-Expression
 ```
 
 ## 架构
