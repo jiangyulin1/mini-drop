@@ -22,6 +22,7 @@ import grpc
 
 from agent.mini_drop_agent.collectors.base import CollectorTask
 from agent.mini_drop_agent.collectors.perf import PerfCollector
+from agent.mini_drop_agent.collectors.pyspy import PySpyCollector
 from agent.mini_drop_agent.config import AgentConfig, load_config
 from server.app.generated import (
     healthcheck_pb2,
@@ -36,6 +37,7 @@ from server.app.generated import (
 
 COLLECTORS = {
     "perf_cpu": PerfCollector(),
+    "pyspy": PySpyCollector(),
 }
 
 CAPABILITIES = sorted(COLLECTORS.keys())
