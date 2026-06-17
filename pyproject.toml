@@ -11,6 +11,7 @@ dependencies = [
     "grpcio-tools>=1.48",
     "protobuf>=3.20",
     "psycopg[binary]>=3.1",
+    "minio>=7.0",
     "requests",
     "sqlalchemy>=2.0",
     "pytest",

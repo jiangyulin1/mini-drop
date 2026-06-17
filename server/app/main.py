@@ -8,6 +8,7 @@ Web 通过 HTTP API 即时可见。
 
 from __future__ import annotations
 
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
@@ -20,6 +21,7 @@ from server.app.schemas import (
     TaskView,
 )
 from server.app.sql_repository import SqlRepository
+from server.app import storage as store
 
 repo = SqlRepository()
 
@@ -32,6 +34,8 @@ def _status_value(status) -> str:
 async def _lifespan(_app: FastAPI):
     """应用生命周期：启动时拉起 gRPC，关闭时停止。"""
     init_db()
+    if os.getenv("MINIO_AUTO_CREATE_BUCKET", "0") == "1":
+        store.ensure_bucket(os.getenv("MINIO_BUCKET", "mini-drop"))
     _grpc = serve_in_background(repo)
     yield
     _grpc.stop(grace=None).wait(timeout=5)
@@ -136,6 +140,18 @@ def get_task_artifacts(task_id: str) -> APIResponse:
     if task_id not in repo.tasks:
         raise HTTPException(status_code=404, detail="任务不存在")
     return APIResponse(data=repo.artifacts.get(task_id, []))
+
+
+@app.get("/api/storage/presign")
+def presign_url(bucket: str = "mini-drop", key: str = "", expires: int = 3600) -> APIResponse:
+    """生成 MinIO 预签名下载 URL。"""
+    if not key:
+        raise HTTPException(status_code=400, detail="key 参数不能为空")
+    try:
+        url = store.presigned_get_url(bucket, key, expires)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return APIResponse(data={"url": url, "expires_sec": expires})
 
 
 @app.post("/api/tasks/{task_id}/diagnose")

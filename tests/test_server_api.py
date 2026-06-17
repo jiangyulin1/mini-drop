@@ -11,6 +11,7 @@
 import pytest
 from fastapi.testclient import TestClient
 
+from server.app import storage as store
 from server.app.database import init_db, reset_engine
 from server.app.main import app, repo
 from server.app.models import Base
@@ -203,6 +204,36 @@ class TestTaskArtifacts:
         arts = client.get(f"/api/tasks/{task_id}/artifacts").json()["data"]
         assert len(arts) == 1
         assert arts[0]["artifact_type"] == "raw"
+
+
+class TestStoragePresign:
+    """对象存储预签名 URL 端点。"""
+
+    def test_presign_returns_url(self, client: TestClient, monkeypatch):
+        monkeypatch.setattr(
+            store,
+            "presigned_get_url",
+            lambda bucket, key, expires: "http://minio:9000/mini-drop/artifact.svg",
+        )
+        resp = client.get("/api/storage/presign", params={
+            "bucket": "mini-drop",
+            "key": "tasks/demo/flamegraph.svg",
+            "expires": 600,
+        })
+        assert resp.status_code == 200
+        assert resp.json()["data"]["url"].startswith("http://minio:9000")
+
+    def test_presign_rejects_empty_key(self, client: TestClient):
+        resp = client.get("/api/storage/presign", params={"bucket": "mini-drop"})
+        assert resp.status_code == 400
+
+    def test_presign_rejects_invalid_expires(self, client: TestClient):
+        resp = client.get("/api/storage/presign", params={
+            "bucket": "mini-drop",
+            "key": "tasks/demo/flamegraph.svg",
+            "expires": 0,
+        })
+        assert resp.status_code == 400
 
 
 class TestDiagnose:
