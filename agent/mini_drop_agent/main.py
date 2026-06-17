@@ -21,6 +21,7 @@ from typing import Any
 import grpc
 
 from agent.mini_drop_agent.collectors.base import CollectorTask
+from agent.mini_drop_agent.collectors.continuous import ContinuousCollector
 from agent.mini_drop_agent.collectors.ebpf import EBPFCollector
 from agent.mini_drop_agent.collectors.perf import PerfCollector
 from agent.mini_drop_agent.collectors.pyspy import PySpyCollector
@@ -40,6 +41,7 @@ COLLECTORS = {
     "perf_cpu": PerfCollector(),
     "ebpf_io": EBPFCollector(),
     "pyspy": PySpyCollector(),
+    "continuous_perf": ContinuousCollector(),
 }
 
 CAPABILITIES = sorted(COLLECTORS.keys())
