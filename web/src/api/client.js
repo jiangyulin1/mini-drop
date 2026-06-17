@@ -77,3 +77,13 @@ export function getDiagnosis(diagnosisId) {
 export function submitDiagnosisFeedback(diagnosisId, payload) {
   return api.post(`/diagnoses/${diagnosisId}/feedback`, payload);
 }
+
+// ── NLP 自然语言采集 ────────────────────────────────────────────
+
+export function nlpParse(query) {
+  return api.post("/nlp/parse", { query });
+}
+
+export function nlpSummarize(taskId) {
+  return api.post("/nlp/summarize", { task_id: taskId });
+}

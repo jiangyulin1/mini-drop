@@ -3,6 +3,7 @@ import { Alert, Button, Card, Col, Row, Space, Spin, Table, Tag, Typography } fr
 import { ApiOutlined, ReloadOutlined } from "@ant-design/icons";
 import { Link } from "react-router-dom";
 import { healthz, listAgents, listTasks } from "../api/client";
+import NLPTaskInput from "../components/NLPTaskInput";
 
 function statusColor(status) {
   if (status === "DONE" || status === "ONLINE") return "green";
@@ -76,6 +77,8 @@ export default function Dashboard() {
         <Typography.Title level={4} style={{ margin: 0 }}>任务面板</Typography.Title>
         <Button icon={<ReloadOutlined />} onClick={refresh}>刷新</Button>
       </Space>
+
+      <NLPTaskInput onTaskCreated={() => refresh()} />
 
       {error && <Alert type="error" message={error} showIcon />}
 
