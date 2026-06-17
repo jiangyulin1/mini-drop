@@ -25,6 +25,7 @@ from agent.mini_drop_agent.collectors.continuous import ContinuousCollector
 from agent.mini_drop_agent.collectors.ebpf import EBPFCollector
 from agent.mini_drop_agent.collectors.perf import PerfCollector
 from agent.mini_drop_agent.collectors.pyspy import PySpyCollector
+from agent.mini_drop_agent.connection import GrpcConnection
 from agent.mini_drop_agent.config import AgentConfig, load_config
 from server.app.generated import (
     healthcheck_pb2,
@@ -75,84 +76,75 @@ def _run_collector(task_payload: dict[str, Any]) -> tuple[bool, str, list[dict[s
 # ── gRPC 客户端 ───────────────────────────────────────────────────
 
 
-def _register(config: AgentConfig) -> None:
+def _register(stub: init_pb2_grpc.InitAgentStub, config: AgentConfig) -> None:
     """通过 gRPC InitAgent.RegisterAgent 注册自身元数据。"""
-    channel = grpc.insecure_channel(config.server_grpc_addr)
-    stub = init_pb2_grpc.InitAgentStub(channel)
-    try:
-        stub.RegisterAgent(
-            init_pb2.RegisterAgentRequest(
-                agent_id=config.agent_id,
-                hostname=socket.gethostname(),
-                ip_addr=config.agent_ip_addr,
-                version="0.1.0",
-                os_info=_os_info(),
-                capabilities=CAPABILITIES,
-            ),
-            timeout=5,
-        )
-    finally:
-        channel.close()
+    stub.RegisterAgent(
+        init_pb2.RegisterAgentRequest(
+            agent_id=config.agent_id,
+            hostname=socket.gethostname(),
+            ip_addr=config.agent_ip_addr,
+            version="0.1.0",
+            os_info=_os_info(),
+            capabilities=CAPABILITIES,
+        ),
+        timeout=5,
+    )
 
 
-def _heartbeat(config: AgentConfig) -> dict[str, Any] | None:
+def _heartbeat(stub: healthcheck_pb2_grpc.HealthCheckStub, config: AgentConfig) -> dict[str, Any] | None:
     """通过 gRPC HealthCheck.Do 发送心跳，返回待执行任务或 None。"""
-    channel = grpc.insecure_channel(config.server_grpc_addr)
-    stub = healthcheck_pb2_grpc.HealthCheckStub(channel)
-    try:
-        resp = stub.Do(
-            healthcheck_pb2.HealthCheckRequest(
-                agent_id=config.agent_id,
-                hostname=socket.gethostname(),
-                ip_addr=config.agent_ip_addr,
-                agent_version="0.1.0",
-            ),
-            timeout=5,
-        )
-        if resp.pending and resp.task_desc.task_id:
-            return {
-                "id": resp.task_desc.task_id,
-                "collector_type": _profiler_to_collector(resp.task_desc.profiler_type),
-                "target_pid": resp.task_desc.sample_argv.pid,
-                "sample_rate": resp.task_desc.sample_argv.hz,
-                "duration_sec": resp.task_desc.sample_argv.duration,
-                "request_params": {
-                    "options": {
-                        "callgraph": resp.task_desc.sample_argv.callgraph,
-                        "event": resp.task_desc.sample_argv.event,
-                    },
+    resp = stub.Do(
+        healthcheck_pb2.HealthCheckRequest(
+            agent_id=config.agent_id,
+            hostname=socket.gethostname(),
+            ip_addr=config.agent_ip_addr,
+            agent_version="0.1.0",
+        ),
+        timeout=5,
+    )
+    if resp.pending and resp.task_desc.task_id:
+        return {
+            "id": resp.task_desc.task_id,
+            "collector_type": _profiler_to_collector(resp.task_desc.profiler_type),
+            "target_pid": resp.task_desc.sample_argv.pid,
+            "sample_rate": resp.task_desc.sample_argv.hz,
+            "duration_sec": resp.task_desc.sample_argv.duration,
+            "request_params": {
+                "options": {
+                    "callgraph": resp.task_desc.sample_argv.callgraph,
+                    "event": resp.task_desc.sample_argv.event,
                 },
-            }
-        return None
-    finally:
-        channel.close()
+            },
+        }
+    return None
 
 
-def _notify_result(config: AgentConfig, task_id: str, ok: bool, reason: str, artifacts: list[dict]) -> None:
+def _notify_result(
+    stub: hotmethod_pb2_grpc.HotmethodStub,
+    task_id: str,
+    ok: bool,
+    reason: str,
+    artifacts: list[dict],
+) -> None:
     """通过 gRPC Hotmethod.NotifyResult 上报采集结果。"""
-    channel = grpc.insecure_channel(config.server_grpc_addr)
-    stub = hotmethod_pb2_grpc.HotmethodStub(channel)
-    try:
-        if ok:
-            stub.NotifyResult(
-                hotmethod_pb2.TaskResult(
-                    task_id=task_id,
-                    error_message="",
-                    artifact_type="raw",
-                    artifact_metadata_json=json.dumps(artifacts),
-                ),
-                timeout=10,
-            )
-        else:
-            stub.NotifyResult(
-                hotmethod_pb2.TaskResult(
-                    task_id=task_id,
-                    error_message=reason,
-                ),
-                timeout=10,
-            )
-    finally:
-        channel.close()
+    if ok:
+        stub.NotifyResult(
+            hotmethod_pb2.TaskResult(
+                task_id=task_id,
+                error_message="",
+                artifact_type="raw",
+                artifact_metadata_json=json.dumps(artifacts),
+            ),
+            timeout=10,
+        )
+    else:
+        stub.NotifyResult(
+            hotmethod_pb2.TaskResult(
+                task_id=task_id,
+                error_message=reason,
+            ),
+            timeout=10,
+        )
 
 
 # ── 主循环 ─────────────────────────────────────────────────────────
@@ -168,16 +160,19 @@ def _on_signal(signum, frame):
 def main() -> None:
     global _should_exit
     config = load_config()
+    conn = GrpcConnection(config.server_grpc_addr)
 
     signal.signal(signal.SIGINT, _on_signal)
     signal.signal(signal.SIGTERM, _on_signal)
 
-    _register(config)
+    _register(init_pb2_grpc.InitAgentStub(conn.channel), config)
     print(f"[agent] 注册成功 agent_id={config.agent_id}")
 
     while not _should_exit:
         try:
-            task = _heartbeat(config)
+            task = conn.call_with_retry(
+                lambda: _heartbeat(healthcheck_pb2_grpc.HealthCheckStub(conn.channel), config)
+            )
         except grpc.RpcError as exc:
             print(f"[agent] 心跳失败: {exc.code()} {exc.details()}")
             time.sleep(config.heartbeat_interval_sec)
@@ -191,7 +186,15 @@ def main() -> None:
         ok, reason, artifacts = _run_collector(task)
 
         try:
-            _notify_result(config, task["id"], ok, reason, artifacts)
+            conn.call_with_retry(
+                lambda: _notify_result(
+                    hotmethod_pb2_grpc.HotmethodStub(conn.channel),
+                    task["id"],
+                    ok,
+                    reason,
+                    artifacts,
+                )
+            )
         except grpc.RpcError as exc:
             print(f"[agent] 上报结果失败: {exc.code()} {exc.details()}")
             continue
@@ -202,6 +205,8 @@ def main() -> None:
             print(f"[agent] 任务失败 task_id={task['id']} reason={reason}")
 
         time.sleep(config.heartbeat_interval_sec)
+
+    conn.close()
 
 
 # ── 辅助 ───────────────────────────────────────────────────────────
