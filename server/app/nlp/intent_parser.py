@@ -7,11 +7,9 @@ LLM 只能调用 create_profiling_task 这个预定义 function，
 from __future__ import annotations
 
 import json
-import os
 
+from server.app.ai_provider import get_ai_settings, is_feature_enabled
 from server.app.nlp.tool_schemas import CREATE_PROFILING_TASK_SCHEMA, NLP_SYSTEM_PROMPT
-
-API_BASE = os.getenv("DEEPSEEK_API_BASE", "https://api.deepseek.com")
 
 # 参数硬约束（不受 LLM 输出影响）
 CLAMP_DURATION = (5, 120)
@@ -54,7 +52,7 @@ def parse_intent(user_input: str) -> StructuredIntent:
 
     如果 API Key 未配置，返回基于关键词的保守匹配。
     """
-    if not _get_api_key():
+    if not is_feature_enabled("nlp"):
         return _keyword_fallback(user_input.strip())
 
     messages = [
@@ -63,14 +61,15 @@ def parse_intent(user_input: str) -> StructuredIntent:
     ]
 
     try:
+        settings = get_ai_settings()
         resp = _post_json(
-            f"{API_BASE}/v1/chat/completions",
+            f"{settings.base_url}/v1/chat/completions",
             headers={
-                "Authorization": f"Bearer {_get_api_key()}",
+                "Authorization": f"Bearer {settings.api_key}",
                 "Content-Type": "application/json",
             },
             json={
-                "model": os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
+                "model": settings.model,
                 "messages": messages,
                 "temperature": 0.1,
                 "max_tokens": 512,
@@ -101,15 +100,6 @@ def parse_intent(user_input: str) -> StructuredIntent:
         return _keyword_fallback(user_input.strip())
 
 
-def _get_api_key() -> str:
-    return os.getenv("DEEPSEEK_API_KEY", "")
-
-
-def _post_json(url: str, headers: dict, json: dict, timeout: int):
-    import requests
-    return requests.post(url, headers=headers, json=json, timeout=timeout)
-
-
 def _clamp_and_validate(args: dict) -> StructuredIntent:
     """将 LLM 输出的参数 clamp 到安全范围内。"""
     collector = args.get("collector_type", "perf_cpu")
@@ -133,6 +123,11 @@ def _clamp_and_validate(args: dict) -> StructuredIntent:
         reasoning=reasoning,
         raw_llm_output=args,
     )
+
+
+def _post_json(url: str, headers: dict, json: dict, timeout: int):
+    from server.app.ai_provider import chat_completions
+    return chat_completions(json, timeout=timeout)
 
 
 def _keyword_fallback(text: str) -> StructuredIntent:

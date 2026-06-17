@@ -6,9 +6,7 @@
 
 from __future__ import annotations
 
-import os
-
-API_BASE = os.getenv("DEEPSEEK_API_BASE", "https://api.deepseek.com")
+from server.app.ai_provider import get_ai_settings, is_feature_enabled
 
 SUMMARIZE_SYSTEM_PROMPT = """你是 Mini-Drop 性能诊断报告撰写助手。
 
@@ -29,7 +27,7 @@ def summarize(
     if not top_functions:
         return "当前任务未产出热点函数数据，建议检查采集配置或目标进程状态。"
 
-    if not _get_api_key():
+    if not is_feature_enabled("summarize"):
         return _template_summary(top_functions, suggestions or [])
 
     data_text = f"热点函数: {json_dumps(top_functions[:5])}"
@@ -39,14 +37,15 @@ def summarize(
         data_text += f"\n规则建议: {'; '.join(suggestions[:3])}"
 
     try:
+        settings = get_ai_settings()
         resp = _post_json(
-            f"{API_BASE}/v1/chat/completions",
+            f"{settings.base_url}/v1/chat/completions",
             headers={
-                "Authorization": f"Bearer {_get_api_key()}",
+                "Authorization": f"Bearer {settings.api_key}",
                 "Content-Type": "application/json",
             },
             json={
-                "model": os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
+                "model": settings.model,
                 "messages": [
                     {"role": "system", "content": SUMMARIZE_SYSTEM_PROMPT},
                     {"role": "user", "content": data_text},
@@ -110,15 +109,11 @@ def _template_summary(top_functions: list[dict], suggestions: list[str]) -> str:
     return "。".join(parts)
 
 
-def _get_api_key() -> str:
-    return os.getenv("DEEPSEEK_API_KEY", "")
-
-
-def _post_json(url: str, headers: dict, json: dict, timeout: int):
-    import requests
-    return requests.post(url, headers=headers, json=json, timeout=timeout)
-
-
 def json_dumps(obj, **kw):
     import json
     return json.dumps(obj, ensure_ascii=False, **kw)
+
+
+def _post_json(url: str, headers: dict, json: dict, timeout: int):
+    from server.app.ai_provider import chat_completions
+    return chat_completions(json, timeout=timeout)

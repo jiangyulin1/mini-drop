@@ -6,6 +6,14 @@ Python 用户态采样、持续 Profiling、AI 智能归因和自然语言采集
 ## 快速开始
 
 ```bash
+pip install micro-drop
+micro-drop serve
+# 另一个终端或生产服务器上
+micro-drop agent
+```
+
+源码部署：
+```bash
 git clone https://github.com/jiangyulin1/mini-drop.git
 cd mini-drop
 docker compose up -d
@@ -22,6 +30,43 @@ make demo
 - Ubuntu 22.04 / Docker Compose v2
 - Agent 容器需要 privileged + pid:host（perf / bpftrace 权限）
 - 可选：DEEPSEEK_API_KEY（启用 AI 归因和自然语言采集）
+
+## AI Provider
+
+AI 调用兼容 OpenAI-style `chat/completions` 接口，可通过 URL + Key 接不同厂商：
+
+```bash
+export MINI_DROP_AI_ENABLED=full
+export MINI_DROP_AI_PROVIDER=deepseek
+export MINI_DROP_AI_BASE_URL=https://api.deepseek.com
+export MINI_DROP_AI_API_KEY=sk-...
+export MINI_DROP_AI_MODEL=deepseek-chat
+```
+
+开关层级：
+
+```bash
+MINI_DROP_AI_ENABLED=full
+MINI_DROP_AI_ENABLED=none
+MINI_DROP_AI_ENABLED=nlp-only
+MINI_DROP_AI_ENABLED=rca-only
+
+MINI_DROP_NLP_ENABLED=true
+MINI_DROP_RCA_ENABLED=true
+MINI_DROP_SUMMARIZE_ENABLED=true
+```
+
+## CLI
+
+`micro-drop` 面向机器、脚本和老手：所有分析命令默认输出 JSON，适合管道、CI、差分分析和告警。
+
+```bash
+micro-drop ai-config
+micro-drop parse "mysqld CPU 飙高，帮我看看"
+micro-drop summarize --top-json /tmp/mini-drop/task/top.json
+micro-drop diagnose-local --evidence evidence.json
+micro-drop diff-top --base before/top.json --head after/top.json --threshold 5
+```
 
 ## 架构
 
@@ -92,7 +137,7 @@ web/       React SPA 前端
 proto/     5 个 gRPC 契约文件
 demo/      演示负载
 deploy/    Docker + nginx 部署配置
-tests/     193 个测试（含 4 E2E）
+tests/     199 个测试（含 4 E2E）
 docs/      设计文档 + 归因评测报告
 ```
 

@@ -6,9 +6,9 @@
 from __future__ import annotations
 
 import json
-import os
 from datetime import datetime, timezone
 
+from server.app.ai_provider import get_ai_settings
 from server.app.rca.calibrator import calibrate, format_for_llm
 from server.app.rca.candidates import generate_candidates
 from server.app.rca.evidence import collect_evidence
@@ -85,7 +85,7 @@ def run_diagnosis_context(
     auto_execute_safe: bool = True,
 ) -> DiagnosisOutcome:
     """执行带工具证据和修复计划的完整诊断。"""
-    model = model_name or os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+    model = model_name or get_ai_settings().model
 
     tool_results = run_rca_tools(
         task_record=task_record,

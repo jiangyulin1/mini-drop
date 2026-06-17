@@ -6,24 +6,16 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import time
 
+from server.app.ai_provider import is_feature_enabled
 from server.app.rca.models import CauseEntry, DiagnosisReport, EvidenceInput, ValidatedReport
 from server.app.rca.prompt import build_system_prompt, build_user_message
 
 
 # 最大自修复重试次数
 MAX_RETRIES = 2
-
-# DeepSeek API 基础 URL（在调用时读取 KEY 以保证 mock 环境变量可生效）
-API_BASE = os.getenv("DEEPSEEK_API_BASE", "https://api.deepseek.com")
-
-
-def _get_api_key() -> str:
-    return os.getenv("DEEPSEEK_API_KEY", "")
-
 
 def diagnose(
     task_id: str,
@@ -46,7 +38,7 @@ def diagnose(
     system_prompt = build_system_prompt(model_name)
     user_message = build_user_message(evidence_json, candidates_json)
 
-    if not _get_api_key():
+    if not is_feature_enabled("rca"):
         return _fallback_report(task_id, evidence, candidates_json)
 
     messages = [
@@ -124,11 +116,8 @@ def _call_deepseek(messages: list[dict], model: str) -> str:
         RuntimeError: API 返回非 200。
     """
     resp = _post_json(
-        f"{API_BASE}/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {_get_api_key()}",
-            "Content-Type": "application/json",
-        },
+        "",
+        headers={},
         json={
             "model": model,
             "messages": messages,
@@ -148,8 +137,8 @@ def _call_deepseek(messages: list[dict], model: str) -> str:
 
 
 def _post_json(url: str, headers: dict, json: dict, timeout: int):
-    import requests
-    return requests.post(url, headers=headers, json=json, timeout=timeout)
+    from server.app.ai_provider import chat_completions
+    return chat_completions(json, timeout=timeout)
 
 
 def _validate_and_parse(raw: str, evidence: EvidenceInput) -> tuple[DiagnosisReport | None, list[str]]:
