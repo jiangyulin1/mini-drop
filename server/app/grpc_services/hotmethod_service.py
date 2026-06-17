@@ -45,10 +45,26 @@ class HotmethodService(hotmethod_pb2_grpc.HotmethodServicer):
         if artifacts:
             self._repo.add_artifacts(task_id, artifacts)
 
-        # 产物写入后迁移到 ANALYZING
+        # 产物写入后迁移到 ANALYZING；如果 Agent 已同步产出分析结果，MVP 闭环直接完成任务。
         self._repo.transition_task(
             task_id, TaskStatus.ANALYZING,
             "产物已记录，等待分析", Actor.SERVER,
         )
+        if _has_analysis_result(artifacts):
+            self._repo.transition_task(
+                task_id, TaskStatus.DONE,
+                "Analyzer 已生成火焰图和热点分析结果", Actor.ANALYZER,
+            )
 
         return Empty()
+
+
+def _has_analysis_result(artifacts: list[dict]) -> bool:
+    artifact_types = {item.get("artifact_type") for item in artifacts}
+    return bool({
+        "flamegraph_json",
+        "flamegraph_svg",
+        "top_json",
+        "ebpf_metrics",
+        "continuous_summary",
+    } & artifact_types)

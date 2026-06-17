@@ -30,7 +30,7 @@ Web (React + Ant Design + d3-flame-graph + ECharts)
   → REST /api → Server (FastAPI :8191)
                    → gRPC (:50051) → Agent
                        → perf / eBPF / py-spy / continuous
-                   → Analyzer CLI (火焰图 JSON 树 + TopN)
+                   → Agent 本地 Analyzer CLI (火焰图 JSON 树 + TopN)
                    → DeepSeek (智能归因 + 自然语言采集)
   ← PostgreSQL ↔ MinIO
 ```
@@ -92,7 +92,7 @@ web/       React SPA 前端
 proto/     5 个 gRPC 契约文件
 demo/      演示负载
 deploy/    Docker + nginx 部署配置
-tests/     190 个测试（含 4 E2E）
+tests/     193 个测试（含 4 E2E）
 docs/      设计文档 + 归因评测报告
 ```
 

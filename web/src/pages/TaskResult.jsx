@@ -16,11 +16,12 @@ import {
   Tooltip,
   Typography,
 } from "antd";
-import { ExperimentOutlined, ReloadOutlined } from "@ant-design/icons";
+import { BarChartOutlined, ExperimentOutlined, FileTextOutlined, ReloadOutlined } from "@ant-design/icons";
 import { useParams } from "react-router-dom";
 import {
   getDiagnosis,
   getTask,
+  getTaskArtifactContent,
   getTaskArtifacts,
   getTaskEvents,
   listTaskDiagnoses,
@@ -45,6 +46,7 @@ export default function TaskResult() {
   const [diagnoses, setDiagnoses] = useState([]);
   const [diagnosis, setDiagnosis] = useState(null);
   const [diagnosing, setDiagnosing] = useState(false);
+  const [analysis, setAnalysis] = useState({ top: [], svg: "" });
 
   useEffect(() => {
     async function load() {
@@ -60,6 +62,7 @@ export default function TaskResult() {
         setTask(taskResp);
         setEvents(eventResp || []);
         setArtifacts(artifactResp || []);
+        await loadAnalysisArtifacts(artifactResp || []);
         setDiagnoses(diagnosisList || []);
         if (diagnosisList?.[0]?.id) {
           setDiagnosis(await getDiagnosis(diagnosisList[0].id));
@@ -74,6 +77,28 @@ export default function TaskResult() {
     }
     load();
   }, [taskId]);
+
+  async function loadAnalysisArtifacts(artifactResp) {
+    const hasTop = artifactResp.some((item) => item.artifact_type === "top_json");
+    const hasSvg = artifactResp.some((item) => item.artifact_type === "flamegraph_svg");
+    const next = { top: [], svg: "" };
+    if (hasTop) {
+      try {
+        next.top = await getTaskArtifactContent(taskId, "top_json");
+      } catch {
+        next.top = [];
+      }
+    }
+    if (hasSvg) {
+      try {
+        const content = await getTaskArtifactContent(taskId, "flamegraph_svg");
+        next.svg = content.text || "";
+      } catch {
+        next.svg = "";
+      }
+    }
+    setAnalysis(next);
+  }
 
   const artifactColumns = [
     { title: "类型", dataIndex: "artifact_type" },
@@ -125,6 +150,9 @@ export default function TaskResult() {
   const repairPlan = diagnosis?.repair_plan;
   const toolResults = diagnosis?.tool_results || [];
   const topCause = rankedCauses[0];
+  const topArtifact = artifacts.find((item) => item.artifact_type === "top_json");
+  const flameArtifact = artifacts.find((item) => item.artifact_type === "flamegraph_svg" || item.artifact_type === "flamegraph_json");
+  const suggestionArtifact = artifacts.find((item) => item.artifact_type === "suggestions_md");
 
   return (
     <Space direction="vertical" size={16} style={{ width: "100%" }}>
@@ -172,6 +200,56 @@ export default function TaskResult() {
             pagination={false}
             size="middle"
           />
+        </Card>
+
+        <Card title="分析结果" style={{ marginTop: 16 }}>
+          {flameArtifact || topArtifact || suggestionArtifact ? (
+            <Space direction="vertical" size={12} style={{ width: "100%" }}>
+              <Space wrap>
+                {flameArtifact && (
+                  <Tag icon={<FileTextOutlined />} color="blue">
+                    火焰图: {flameArtifact.filename || flameArtifact.local_path || flameArtifact.object_key}
+                  </Tag>
+                )}
+                {topArtifact && (
+                  <Tag icon={<BarChartOutlined />} color="green">
+                    TopN: {topArtifact.filename || topArtifact.local_path || topArtifact.object_key}
+                  </Tag>
+                )}
+                {suggestionArtifact && (
+                  <Tag color="orange">
+                    建议: {suggestionArtifact.filename || suggestionArtifact.local_path || suggestionArtifact.object_key}
+                  </Tag>
+                )}
+              </Space>
+              <Alert
+                type={task?.status === "DONE" ? "success" : "info"}
+                message={task?.status === "DONE" ? "分析完成，火焰图与热点产物已生成" : "分析产物已记录，可在产物列表中查看路径"}
+                showIcon
+              />
+              {analysis.svg && (
+                <div
+                  style={{ border: "1px solid #f0f0f0", overflowX: "auto", maxHeight: 360 }}
+                  dangerouslySetInnerHTML={{ __html: analysis.svg }}
+                />
+              )}
+              {analysis.top.length > 0 && (
+                <Table
+                  rowKey={(record) => record.name}
+                  dataSource={analysis.top.slice(0, 8)}
+                  pagination={false}
+                  size="small"
+                  columns={[
+                    { title: "热点函数", dataIndex: "name" },
+                    { title: "样本数", dataIndex: "samples", width: 120 },
+                    { title: "占比", dataIndex: "percent", width: 160, render: (value) => <Progress percent={Math.round(value || 0)} size="small" /> },
+                  ]}
+                />
+              )}
+            </Space>
+          ) : (
+            <Empty description="暂无火焰图或 TopN 分析结果" />
+          )}
         </Card>
 
         <Card

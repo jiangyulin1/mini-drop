@@ -1,7 +1,7 @@
 import { useState } from "react";
-import { Alert, Button, Card, Descriptions, Input, Modal, Select, Space, Tag, Typography } from "antd";
+import { Alert, Button, Card, Descriptions, Input, Select, Space, Tag, Typography } from "antd";
 import { ThunderboltOutlined } from "@ant-design/icons";
-import { nlpParse, createTask } from "../api/client";
+import { nlpParse, createTask, listAgents } from "../api/client";
 
 const COLLECTOR_LABELS = {
   perf_cpu: "perf CPU 火焰图",
@@ -42,9 +42,15 @@ export default function NLPTaskInput({ onTaskCreated }) {
     setSubmitting(true);
     setError("");
     try {
+      const agents = await listAgents();
+      const agent = agents.find((item) => item.status === "ONLINE") || agents[0];
+      if (!agent?.id) {
+        setError("暂无可用 Agent，请先启动 Agent 后再创建采集任务");
+        return;
+      }
       const taskResp = await createTask({
         name: `NLP: ${result.process_name}`,
-        agent_id: "agent_local_demo",
+        agent_id: agent.id,
         target_pid: pid,
         collector_type: result.collector_type,
         sample_rate: result.sample_rate,

@@ -7,7 +7,7 @@ Server 负责任务编排和状态管理，Agent 在目标主机执行 perf/eBPF
 Analyzer 将原始数据转为 d3-flame-graph 交互式火焰图和热点分析，智能归因引擎提供
 可追溯的诊断报告。
 
-项目在 7 天内从空仓库逐步构建到完整可演示平台，24 个 commit 记录真实开发过程。
+项目在 7 天内从空仓库逐步构建到完整可演示平台，多批次 commit 记录真实开发过程。
 
 ## 2. 总体架构
 
@@ -16,7 +16,7 @@ Web (React + Ant Design + d3-flame-graph)
   → REST /api/* → Server (FastAPI :8191)
                     → gRPC (:50051) → Agent (心跳 + 采集器调度)
                                          → perf / eBPF / py-spy / continuous
-                    → Analyzer CLI (perf script → flamegraph JSON 树)
+                    → Agent 本地 Analyzer CLI (perf script → flamegraph JSON 树)
                     → DeepSeek API (智能归因 + 自然语言采集)
   ← PostgreSQL (任务 / 状态事件 / 审计 / 诊断)
   ← MinIO (采集产物 / 火焰图 / 分析结果)

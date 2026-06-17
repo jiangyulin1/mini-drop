@@ -201,6 +201,25 @@ class TestHotmethodNotifyResult:
         assert task.status == TaskStatus.ANALYZING
         assert len(grpc_fix.repo.artifacts.get(task_id, [])) == 1
 
+    def test_notify_analysis_artifacts_transitions_to_done(self, grpc_fix: GrpcFixture):
+        task_id = self._create_and_start_task(grpc_fix)
+        grpc_fix.hotmethod_stub.NotifyResult(
+            hotmethod_pb2.TaskResult(
+                task_id=task_id,
+                error_message="",
+                artifact_metadata_json=(
+                    '[{"artifact_type":"raw","filename":"perf.data"},'
+                    '{"artifact_type":"flamegraph_json","filename":"flamegraph.json"},'
+                    '{"artifact_type":"top_json","filename":"top.json"}]'
+                ),
+            )
+        )
+        task = grpc_fix.repo.tasks[task_id]
+        assert task.status == TaskStatus.DONE
+        events = [event.to_status for event in grpc_fix.repo.events if event.task_id == task_id]
+        assert TaskStatus.ANALYZING in events
+        assert TaskStatus.DONE in events
+
     def test_notify_failure_transitions_to_failed(self, grpc_fix: GrpcFixture):
         task_id = self._create_and_start_task(grpc_fix)
         grpc_fix.hotmethod_stub.NotifyResult(

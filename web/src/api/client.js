@@ -62,6 +62,10 @@ export function getTaskArtifacts(taskId) {
   return api.get(`/tasks/${taskId}/artifacts`);
 }
 
+export function getTaskArtifactContent(taskId, artifactType) {
+  return api.get(`/tasks/${taskId}/artifacts/${artifactType}/content`);
+}
+
 export function triggerDiagnose(taskId) {
   return api.post(`/tasks/${taskId}/diagnose`);
 }

@@ -83,12 +83,37 @@ class TestPerfExecution:
              mock.patch.object(collector, "_check_perf_paranoid", return_value=True), \
              mock.patch.object(collector, "_pid_exists", return_value=True), \
              mock.patch("subprocess.Popen", return_value=mock_proc), \
+             mock.patch.object(collector, "_analyze_perf_data", return_value=([], "")), \
              mock.patch("os.setpgrp", create=True):
             result = collector.collect(task)
 
         assert result.ok is True
         assert result.artifacts[0]["artifact_type"] == "raw"
         assert result.artifacts[0]["size_bytes"] > 0
+
+    def test_perf_attaches_analyzer_artifacts(self, collector: PerfCollector, task: CollectorTask, tmp_path):
+        collector.OUTPUT_BASE = str(tmp_path)
+
+        perf_data = tmp_path / task.id / "perf.data"
+        perf_data.parent.mkdir(parents=True, exist_ok=True)
+        perf_data.write_text("perf data")
+
+        mock_proc = _mock_popen_complete()
+        analysis = [
+            {"artifact_type": "flamegraph_json", "filename": "flamegraph.json"},
+            {"artifact_type": "top_json", "filename": "top.json"},
+        ]
+
+        with mock.patch("shutil.which", return_value="/usr/bin/perf"), \
+             mock.patch.object(collector, "_check_perf_paranoid", return_value=True), \
+             mock.patch.object(collector, "_pid_exists", return_value=True), \
+             mock.patch("subprocess.Popen", return_value=mock_proc), \
+             mock.patch.object(collector, "_analyze_perf_data", return_value=(analysis, "")), \
+             mock.patch("os.setpgrp", create=True):
+            result = collector.collect(task)
+
+        artifact_types = {item["artifact_type"] for item in result.artifacts}
+        assert {"raw", "flamegraph_json", "top_json"} <= artifact_types
 
     def test_perf_nonzero_exit_returns_failure(self, collector: PerfCollector, task: CollectorTask, tmp_path):
         collector.OUTPUT_BASE = str(tmp_path)

@@ -149,6 +149,22 @@ def get_task_artifacts(task_id: str) -> APIResponse:
     return APIResponse(data=repo.artifacts.get(task_id, []))
 
 
+@app.get("/api/tasks/{task_id}/artifacts/{artifact_type}/content")
+def get_task_artifact_content(task_id: str, artifact_type: str) -> APIResponse:
+    if task_id not in repo.tasks:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    for artifact in repo.artifacts.get(task_id, []):
+        if artifact.get("artifact_type") != artifact_type:
+            continue
+        local_path = artifact.get("local_path")
+        if not local_path or not os.path.isfile(local_path):
+            raise HTTPException(status_code=404, detail="本地产物不存在")
+        if artifact_type.endswith("_json") or artifact.get("content_type") == "application/json":
+            return APIResponse(data=_json_mod.loads(_Path(local_path).read_text(encoding="utf-8")))
+        return APIResponse(data={"text": _Path(local_path).read_text(encoding="utf-8", errors="replace")})
+    raise HTTPException(status_code=404, detail="产物不存在")
+
+
 @app.get("/api/storage/presign")
 def presign_url(bucket: str = "mini-drop", key: str = "", expires: int = 3600) -> APIResponse:
     """生成 MinIO 预签名下载 URL。"""

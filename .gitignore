@@ -39,6 +39,9 @@ artifacts/
 tmp/
 logs/
 *.log
+*.db
+*.sqlite
+*.sqlite3
 
 # Collected data (large binary files)
 perf.data

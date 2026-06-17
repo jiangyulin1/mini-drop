@@ -206,6 +206,25 @@ class TestTaskArtifacts:
         assert len(arts) == 1
         assert arts[0]["artifact_type"] == "raw"
 
+    def test_artifact_content_reads_local_json(self, client: TestClient, tmp_path):
+        top_path = tmp_path / "top.json"
+        top_path.write_text('[{"name":"fib_hotspot","samples":10,"percent":80.0}]', encoding="utf-8")
+        resp = client.post("/api/tasks", json={
+            "name": "art-content", "agent_id": "a1",
+            "target_pid": 1, "collector_type": "perf_cpu",
+        })
+        task_id = resp.json()["data"]["task_id"]
+        repo.add_artifacts(task_id, [{
+            "artifact_type": "top_json",
+            "filename": "top.json",
+            "local_path": str(top_path),
+            "content_type": "application/json",
+        }])
+
+        content = client.get(f"/api/tasks/{task_id}/artifacts/top_json/content")
+        assert content.status_code == 200
+        assert content.json()["data"][0]["name"] == "fib_hotspot"
+
 
 class TestStoragePresign:
     """对象存储预签名 URL 端点。"""

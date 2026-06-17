@@ -15,6 +15,7 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 
 from agent.mini_drop_agent.collectors.base import CollectorResult, CollectorTask
 
@@ -92,18 +93,26 @@ class PerfCollector:
                 )
 
             size = os.path.getsize(perf_data) if os.path.isfile(perf_data) else 0
+            artifacts = [
+                {
+                    "artifact_type": "raw",
+                    "filename": "perf.data",
+                    "local_path": perf_data,
+                    "content_type": "application/octet-stream",
+                    "size_bytes": size,
+                }
+            ]
+            analysis_artifacts, analysis_reason = self._analyze_perf_data(task.id, perf_data, output_dir)
+            artifacts.extend(analysis_artifacts)
+            reason = "perf record 采集完成"
+            if analysis_artifacts:
+                reason += "，Analyzer 已生成火焰图与 TopN"
+            elif analysis_reason:
+                reason += f"，Analyzer 未完成: {analysis_reason}"
             return CollectorResult(
                 ok=True,
-                reason="perf record 采集完成",
-                artifacts=[
-                    {
-                        "artifact_type": "raw",
-                        "filename": "perf.data",
-                        "local_path": perf_data,
-                        "content_type": "application/octet-stream",
-                        "size_bytes": size,
-                    }
-                ],
+                reason=reason,
+                artifacts=artifacts,
             )
 
         except subprocess.TimeoutExpired:
@@ -149,3 +158,47 @@ class PerfCollector:
         if val is None:
             return True  # 无法读取时不阻断，让 perf 自身报错
         return val <= 1
+
+    @staticmethod
+    def _analyze_perf_data(task_id: str, perf_data: str, output_root: str) -> tuple[list[dict], str]:
+        """MVP 闭环：采集后在 Agent 本地同步生成可展示分析产物。"""
+        cmd = [
+            sys.executable,
+            "-m",
+            "analyzer.mini_drop_analyzer.hotmethod_analyzer",
+            "--task-id",
+            task_id,
+            "--perf-data",
+            perf_data,
+            "--output-dir",
+            os.path.dirname(output_root),
+        ]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, timeout=120)
+        except Exception as exc:
+            return [], str(exc)
+
+        if proc.returncode != 0:
+            err = proc.stderr.decode("utf-8", errors="replace").strip()
+            out = proc.stdout.decode("utf-8", errors="replace").strip()
+            return [], (err or out or f"exit={proc.returncode}")[:200]
+
+        generated = {
+            "flamegraph_json": ("flamegraph.json", "application/json"),
+            "flamegraph_svg": ("flamegraph.svg", "image/svg+xml"),
+            "top_json": ("top.json", "application/json"),
+            "suggestions_md": ("suggestions.md", "text/markdown"),
+        }
+        artifacts: list[dict] = []
+        for artifact_type, (filename, content_type) in generated.items():
+            path = os.path.join(output_root, filename)
+            if not os.path.isfile(path):
+                continue
+            artifacts.append({
+                "artifact_type": artifact_type,
+                "filename": filename,
+                "local_path": path,
+                "content_type": content_type,
+                "size_bytes": os.path.getsize(path),
+            })
+        return artifacts, ""
