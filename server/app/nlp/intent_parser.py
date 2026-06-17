@@ -9,12 +9,9 @@ from __future__ import annotations
 import json
 import os
 
-import requests
-
 from server.app.nlp.tool_schemas import CREATE_PROFILING_TASK_SCHEMA, NLP_SYSTEM_PROMPT
 
 API_BASE = os.getenv("DEEPSEEK_API_BASE", "https://api.deepseek.com")
-API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 
 # 参数硬约束（不受 LLM 输出影响）
 CLAMP_DURATION = (5, 120)
@@ -57,7 +54,7 @@ def parse_intent(user_input: str) -> StructuredIntent:
 
     如果 API Key 未配置，返回基于关键词的保守匹配。
     """
-    if not API_KEY or not _get_api_key():
+    if not _get_api_key():
         return _keyword_fallback(user_input.strip())
 
     messages = [
@@ -66,7 +63,7 @@ def parse_intent(user_input: str) -> StructuredIntent:
     ]
 
     try:
-        resp = requests.post(
+        resp = _post_json(
             f"{API_BASE}/v1/chat/completions",
             headers={
                 "Authorization": f"Bearer {_get_api_key()}",
@@ -105,7 +102,12 @@ def parse_intent(user_input: str) -> StructuredIntent:
 
 
 def _get_api_key() -> str:
-    return API_KEY
+    return os.getenv("DEEPSEEK_API_KEY", "")
+
+
+def _post_json(url: str, headers: dict, json: dict, timeout: int):
+    import requests
+    return requests.post(url, headers=headers, json=json, timeout=timeout)
 
 
 def _clamp_and_validate(args: dict) -> StructuredIntent:

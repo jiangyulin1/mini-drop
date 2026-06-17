@@ -103,7 +103,7 @@ class TestIntentParsing:
             import importlib
             import server.app.nlp.intent_parser as ip
             importlib.reload(ip)
-            with mock.patch("requests.post", return_value=mock_resp):
+            with mock.patch("server.app.nlp.intent_parser._post_json", return_value=mock_resp):
                 result = ip.parse_intent("mysqld CPU 飙高")
                 assert result.collector_type == "perf_cpu"
                 assert result.duration_sec == 30
@@ -159,7 +159,7 @@ class TestSummarizer:
             import importlib
             import server.app.nlp.summarizer as sm
             importlib.reload(sm)
-            with mock.patch("requests.post", return_value=mock_resp):
+            with mock.patch("server.app.nlp.summarizer._post_json", return_value=mock_resp):
                 result = sm.summarize(top)
                 assert "fib_hotspot" in result
 
@@ -171,7 +171,7 @@ class TestSummarizer:
             import importlib
             import server.app.nlp.summarizer as sm
             importlib.reload(sm)
-            with mock.patch("requests.post", return_value=mock_resp):
+            with mock.patch("server.app.nlp.summarizer._post_json", return_value=mock_resp):
                 result = sm.summarize(top)
                 assert "主要发现" in result
 
