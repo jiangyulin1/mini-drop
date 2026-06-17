@@ -84,7 +84,7 @@ def _register(config: AgentConfig) -> None:
             init_pb2.RegisterAgentRequest(
                 agent_id=config.agent_id,
                 hostname=socket.gethostname(),
-                ip_addr="127.0.0.1",
+                ip_addr=config.agent_ip_addr,
                 version="0.1.0",
                 os_info=_os_info(),
                 capabilities=CAPABILITIES,
@@ -104,7 +104,7 @@ def _heartbeat(config: AgentConfig) -> dict[str, Any] | None:
             healthcheck_pb2.HealthCheckRequest(
                 agent_id=config.agent_id,
                 hostname=socket.gethostname(),
-                ip_addr="127.0.0.1",
+                ip_addr=config.agent_ip_addr,
                 agent_version="0.1.0",
             ),
             timeout=5,

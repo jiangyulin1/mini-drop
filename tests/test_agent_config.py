@@ -12,7 +12,7 @@ class TestAgentConfig:
     """配置文件从环境变量读取。"""
 
     def _clean_env(self, monkeypatch):
-        for key in ("AGENT_ID", "AGENT_GRPC_ADDR", "AGENT_HEARTBEAT_INTERVAL_SEC"):
+        for key in ("AGENT_ID", "AGENT_GRPC_ADDR", "AGENT_IP_ADDR", "AGENT_HEARTBEAT_INTERVAL_SEC"):
             monkeypatch.delenv(key, raising=False)
 
     def test_default_config(self, monkeypatch):
@@ -20,6 +20,7 @@ class TestAgentConfig:
         cfg = load_config()
         assert cfg.agent_id == "agent_local_demo"
         assert cfg.server_grpc_addr == "localhost:50051"
+        assert cfg.agent_ip_addr
         assert cfg.heartbeat_interval_sec == 5
 
     def test_custom_agent_id(self, monkeypatch):
@@ -33,6 +34,12 @@ class TestAgentConfig:
         monkeypatch.setenv("AGENT_GRPC_ADDR", "192.168.1.100:50051")
         cfg = load_config()
         assert cfg.server_grpc_addr == "192.168.1.100:50051"
+
+    def test_custom_agent_ip(self, monkeypatch):
+        self._clean_env(monkeypatch)
+        monkeypatch.setenv("AGENT_IP_ADDR", "10.0.0.20")
+        cfg = load_config()
+        assert cfg.agent_ip_addr == "10.0.0.20"
 
     def test_custom_heartbeat_interval(self, monkeypatch):
         self._clean_env(monkeypatch)
