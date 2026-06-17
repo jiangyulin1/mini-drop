@@ -1,6 +1,6 @@
 PYTHON ?= $(if $(wildcard .venv/bin/python),.venv/bin/python,python)
 
-.PHONY: server agent analyzer test lint demo proto
+.PHONY: server agent analyzer test lint demo proto deploy deploy-down
 
 proto:
 	cd proto && bash compile.sh
@@ -23,4 +23,10 @@ lint:
 	$(PYTHON) -m compileall server agent analyzer demo
 
 demo:
-	@echo "demo: run 'python demo/cpu_hotspot.py' first, then create a task via Web or API"
+	bash demo/demo.sh
+
+deploy:
+	docker compose up -d
+
+deploy-down:
+	docker compose down
