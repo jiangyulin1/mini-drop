@@ -176,6 +176,20 @@ class TestTaskPersistence:
         assert pulled.id == task.id
         assert pulled.status == TaskStatus.RUNNING.value
 
+    def test_pending_task_survives_repo_reload_before_heartbeat(self, repo: SqlRepository):
+        repo.register_agent(self.AGENT_ID, "h", self.IP)
+        task = repo.create_task(CreateTaskRequest(
+            name="queued-before-reload", agent_id=self.AGENT_ID,
+            target_pid=401, collector_type="perf_cpu",
+        ))
+
+        repo2 = SqlRepository()
+        pulled = repo2.heartbeat(self.AGENT_ID, self.IP)
+
+        assert pulled is not None
+        assert pulled.id == task.id
+        assert pulled.status == TaskStatus.RUNNING.value
+
 
 class TestArtifactPersistence:
     """产物存储持久化。"""

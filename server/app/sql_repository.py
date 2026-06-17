@@ -46,7 +46,7 @@ class SqlRepository:
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
-        # 任务队列仍用内存，因为 IP→队列的映射无需持久化
+        # Compatibility shim for older tests; dispatch now reads PENDING tasks from DB.
         self._task_queues: dict[str, deque[str]] = {}
 
     # ------------------------------------------------------------------
@@ -113,29 +113,26 @@ class SqlRepository:
                 agent.last_heartbeat_at = now_utc()
                 agent.updated_at = now_utc()
 
-                # 从 IP 队列取下一个 PENDING 任务
-                queue = self._task_queues.get(ip_addr)
-                if not queue:
+                task = (
+                    session.query(TaskModel)
+                    .filter(
+                        TaskModel.agent_id == agent_id,
+                        TaskModel.status == TaskStatus.PENDING.value,
+                    )
+                    .order_by(TaskModel.created_at.asc())
+                    .first()
+                )
+                if task is None:
                     session.commit()
                     return None
 
-                while queue:
-                    task_id = queue[0]
-                    task = session.get(TaskModel, task_id)
-                    if task is not None and task.status == TaskStatus.PENDING.value:
-                        queue.popleft()
-                        self._transition_task_in_session(
-                            session, task_id, TaskStatus.RUNNING,
-                            "Agent 心跳拉取待执行任务", Actor.SERVER,
-                        )
-                        session.commit()
-                        result = task
-                        result.status = TaskStatus.RUNNING.value
-                        return result
-                    queue.popleft()
-
+                self._transition_task_in_session(
+                    session, task.id, TaskStatus.RUNNING,
+                    "Agent 心跳拉取待执行任务", Actor.SERVER,
+                )
                 session.commit()
-                return None
+                task.status = TaskStatus.RUNNING.value
+                return task
             except Exception:
                 session.rollback()
                 raise
@@ -224,12 +221,6 @@ class SqlRepository:
                 self._write_audit(session, "TASK_CREATED", task_id=task_id,
                                   message=f"任务 {task_id} 已创建",
                                   metadata=payload.model_dump())
-
-                # IP 队列
-                ip = agent.ip_addr
-                if ip not in self._task_queues:
-                    self._task_queues[ip] = deque()
-                self._task_queues[ip].append(task_id)
 
                 session.commit()
                 return task
