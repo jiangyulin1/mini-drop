@@ -2,7 +2,7 @@
 name = "mini-drop"
 version = "0.1.0"
 description = "Mini-Drop: a lightweight Linux performance profiling platform"
-requires-python = ">=3.10"
+requires-python = ">=3.9"
 dependencies = [
     "fastapi",
     "uvicorn",
