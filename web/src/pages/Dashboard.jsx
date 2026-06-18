@@ -64,6 +64,24 @@ export default function Dashboard() {
     { title: "Host", dataIndex: "hostname" },
     { title: "IP", dataIndex: "ip_addr", width: 140 },
     {
+      title: "CPU",
+      width: 90,
+      render: (_, record) => `${record.latest_metrics?.self?.cpu_percent ?? 0}%`,
+    },
+    {
+      title: "RSS",
+      width: 100,
+      render: (_, record) => `${record.latest_metrics?.self?.rss_mb ?? 0} MB`,
+    },
+    {
+      title: "IO",
+      width: 120,
+      render: (_, record) => {
+        const self = record.latest_metrics?.self || {};
+        return `${self.read_kb_s ?? 0}/${self.write_kb_s ?? 0} KB/s`;
+      },
+    },
+    {
       title: "状态",
       dataIndex: "status",
       width: 120,

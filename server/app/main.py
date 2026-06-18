@@ -156,7 +156,11 @@ def current_user() -> APIResponse:
 def list_agents() -> APIResponse:
     """返回所有 Agent 列表。调用前自动检查离线。"""
     repo.mark_offline_agents()
-    items = [repo.as_dict(agent) for agent in repo.agents.values()]
+    items = []
+    for agent in repo.agents.values():
+        item = repo.as_dict(agent)
+        item["latest_metrics"] = getattr(repo, "agent_metrics", {}).get(agent.id, {})
+        items.append(item)
     return APIResponse(data=items)
 
 

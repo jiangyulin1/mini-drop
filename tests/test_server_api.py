@@ -28,6 +28,7 @@ def _reset_repo(monkeypatch):
     reset_engine()
     init_db()
     repo._task_queues.clear()
+    repo.agent_metrics.clear()
     repo.register_agent("agent_local_demo", "demo-host", "10.0.0.10")
     repo.register_agent("a1", "agent-one", "10.0.0.11")
     repo.register_agent("a2", "agent-two", "10.0.0.12")
@@ -88,6 +89,19 @@ class TestApiAuth:
         monkeypatch.setenv("MINI_DROP_API_KEY", "secret-token")
         resp = client.get("/api/healthz")
         assert resp.status_code == 200
+
+
+class TestAgents:
+    def test_list_agents_includes_latest_metrics(self, client: TestClient):
+        repo.record_agent_metrics("a1", {
+            "self": {"cpu_percent": 1.5, "rss_mb": 32.0, "read_kb_s": 0.1, "write_kb_s": 0.2},
+            "children": {"children_count": 2},
+        })
+        resp = client.get("/api/agents")
+        assert resp.status_code == 200
+        agents = resp.json()["data"]
+        agent = next(item for item in agents if item["id"] == "a1")
+        assert agent["latest_metrics"]["self"]["cpu_percent"] == 1.5
 
 
 class TestCreateTask:

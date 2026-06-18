@@ -221,6 +221,21 @@ class TestHealthCheck:
         after = grpc_fix.repo.agents[self.AGENT_ID].last_heartbeat_at
         assert after > before
 
+    def test_heartbeat_records_agent_metrics(self, grpc_fix: GrpcFixture):
+        self._register(grpc_fix)
+        grpc_fix.hc_stub.Do(
+            healthcheck_pb2.HealthCheckRequest(
+                agent_id=self.AGENT_ID,
+                ip_addr=self.IP,
+                self_pstats=healthcheck_pb2.common__pb2.PidStats(cpu_percent=1.5, rss_mb=32.0),
+                children_pstats=healthcheck_pb2.common__pb2.PidStats(children_count=2),
+            )
+        )
+        metrics = grpc_fix.repo.agent_metrics[self.AGENT_ID]
+        assert metrics["self"]["cpu_percent"] == 1.5
+        assert metrics["self"]["rss_mb"] == 32.0
+        assert metrics["children"]["children_count"] == 2
+
 
 class TestHotmethodNotifyResult:
     """Hotmethod 服务：采集结果上报。"""

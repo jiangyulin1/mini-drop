@@ -28,6 +28,7 @@ from agent.mini_drop_agent.collectors.pyspy import PySpyCollector
 from agent.mini_drop_agent.connection import GrpcConnection
 from agent.mini_drop_agent.config import AgentConfig, load_config
 from agent.mini_drop_agent.logging_utils import log_event
+from agent.mini_drop_agent.metrics import ProcessStatsSampler
 from server.app.generated import (
     healthcheck_pb2,
     healthcheck_pb2_grpc,
@@ -92,15 +93,23 @@ def _register(stub: init_pb2_grpc.InitAgentStub, config: AgentConfig) -> None:
     )
 
 
-def _heartbeat(stub: healthcheck_pb2_grpc.HealthCheckStub, config: AgentConfig) -> dict[str, Any] | None:
+def _heartbeat(
+    stub: healthcheck_pb2_grpc.HealthCheckStub,
+    config: AgentConfig,
+    sampler: ProcessStatsSampler | None = None,
+) -> dict[str, Any] | None:
     """通过 gRPC HealthCheck.Do 发送心跳，返回待执行任务或 None。"""
+    request = healthcheck_pb2.HealthCheckRequest(
+        agent_id=config.agent_id,
+        hostname=socket.gethostname(),
+        ip_addr=config.agent_ip_addr,
+        agent_version="0.1.0",
+    )
+    if sampler is not None:
+        _fill_pid_stats(request.self_pstats, sampler.sample_self())
+        _fill_pid_stats(request.children_pstats, sampler.sample_children())
     resp = stub.Do(
-        healthcheck_pb2.HealthCheckRequest(
-            agent_id=config.agent_id,
-            hostname=socket.gethostname(),
-            ip_addr=config.agent_ip_addr,
-            agent_version="0.1.0",
-        ),
+        request,
         timeout=5,
     )
     if resp.pending and resp.task_desc.task_id:
@@ -162,6 +171,7 @@ def main() -> None:
     global _should_exit
     config = load_config()
     conn = GrpcConnection(config.server_grpc_addr, auth_token=config.grpc_auth_token)
+    sampler = ProcessStatsSampler()
 
     signal.signal(signal.SIGINT, _on_signal)
     signal.signal(signal.SIGTERM, _on_signal)
@@ -172,7 +182,7 @@ def main() -> None:
     while not _should_exit:
         try:
             task = conn.call_with_retry(
-                lambda: _heartbeat(healthcheck_pb2_grpc.HealthCheckStub(conn.channel), config)
+                lambda: _heartbeat(healthcheck_pb2_grpc.HealthCheckStub(conn.channel), config, sampler)
             )
         except grpc.RpcError as exc:
             log_event("error", "heartbeat_failed", code=exc.code(), details=exc.details())
@@ -222,6 +232,14 @@ def main() -> None:
 def _profiler_to_collector(profiler_type: int) -> str:
     mapping = {0: "perf_cpu", 3: "pyspy", 4: "ebpf_io"}
     return mapping.get(profiler_type, "perf_cpu")
+
+
+def _fill_pid_stats(message, stats: dict[str, Any]) -> None:
+    message.cpu_percent = float(stats.get("cpu_percent", 0.0) or 0.0)
+    message.rss_mb = float(stats.get("rss_mb", 0.0) or 0.0)
+    message.read_kb_s = float(stats.get("read_kb_s", 0.0) or 0.0)
+    message.write_kb_s = float(stats.get("write_kb_s", 0.0) or 0.0)
+    message.children_count = int(stats.get("children_count", 0) or 0)
 
 
 def _os_info() -> str:

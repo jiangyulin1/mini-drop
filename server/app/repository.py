@@ -90,6 +90,7 @@ class InMemoryRepository:
         self.events: list[StatusEvent] = []
         self.audit_logs: list[AuditLog] = []
         self.artifacts: dict[str, list[dict[str, Any]]] = {}
+        self.agent_metrics: dict[str, dict[str, Any]] = {}
 
         # 每个 Agent IP 维护一个任务队列。
         # key = agent.ip_addr, value = deque of task_id
@@ -284,6 +285,10 @@ class InMemoryRepository:
     def get_task_events(self, task_id: str) -> list[StatusEvent]:
         """返回指定任务的所有状态迁移事件。"""
         return [e for e in self.events if e.task_id == task_id]
+
+    def record_agent_metrics(self, agent_id: str, metrics: dict[str, Any]) -> None:
+        with self._lock:
+            self.agent_metrics[agent_id] = dict(metrics)
 
     # ------------------------------------------------------------------
     # Artifacts

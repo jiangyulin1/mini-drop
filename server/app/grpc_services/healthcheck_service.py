@@ -13,6 +13,8 @@ class HealthCheckService(healthcheck_pb2_grpc.HealthCheckServicer):
 
     def Do(self, request: healthcheck_pb2.HealthCheckRequest, context) -> healthcheck_pb2.HealthCheckResponse:
         # 记录心跳，检查有无待执行任务
+        if hasattr(self._repo, "record_agent_metrics"):
+            self._repo.record_agent_metrics(request.agent_id, _metrics_from_request(request))
         task = self._repo.heartbeat(request.agent_id, request.ip_addr)
 
         response = healthcheck_pb2.HealthCheckResponse()
@@ -47,3 +49,20 @@ class HealthCheckService(healthcheck_pb2_grpc.HealthCheckServicer):
             "continuous_perf": 0,  # 同样是 perf
         }
         return mapping.get(collector_type, 0)
+
+
+def _pid_stats_to_dict(stats) -> dict:
+    return {
+        "cpu_percent": round(float(stats.cpu_percent), 3),
+        "rss_mb": round(float(stats.rss_mb), 3),
+        "read_kb_s": round(float(stats.read_kb_s), 3),
+        "write_kb_s": round(float(stats.write_kb_s), 3),
+        "children_count": int(stats.children_count),
+    }
+
+
+def _metrics_from_request(request: healthcheck_pb2.HealthCheckRequest) -> dict:
+    return {
+        "self": _pid_stats_to_dict(request.self_pstats),
+        "children": _pid_stats_to_dict(request.children_pstats),
+    }

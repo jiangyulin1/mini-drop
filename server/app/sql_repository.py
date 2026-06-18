@@ -48,6 +48,7 @@ class SqlRepository:
         self._lock = threading.RLock()
         # Compatibility shim for older tests; dispatch now reads PENDING tasks from DB.
         self._task_queues: dict[str, deque[str]] = {}
+        self.agent_metrics: dict[str, dict[str, Any]] = {}
 
     # ------------------------------------------------------------------
     # Agent
@@ -182,6 +183,10 @@ class SqlRepository:
             return session.query(AgentModel).filter(AgentModel.ip_addr == ip_addr).first()
         finally:
             session.close()
+
+    def record_agent_metrics(self, agent_id: str, metrics: dict[str, Any]) -> None:
+        with self._lock:
+            self.agent_metrics[agent_id] = dict(metrics)
 
     # ------------------------------------------------------------------
     # Task
