@@ -10,10 +10,11 @@ import json
 
 from server.app.ai_provider import get_ai_settings, is_feature_enabled
 from server.app.nlp.tool_schemas import CREATE_PROFILING_TASK_SCHEMA, NLP_SYSTEM_PROMPT
+from server.app.schemas import MAX_SAMPLE_RATE, MAX_TASK_DURATION_SEC, MIN_SAMPLE_RATE
 
 # 参数硬约束（不受 LLM 输出影响）
-CLAMP_DURATION = (5, 120)
-CLAMP_SAMPLE_RATE = (1, 999)
+CLAMP_DURATION = (5, MAX_TASK_DURATION_SEC)
+CLAMP_SAMPLE_RATE = (MIN_SAMPLE_RATE, MAX_SAMPLE_RATE)
 VALID_COLLECTORS = {"perf_cpu", "ebpf_io", "pyspy", "continuous_perf"}
 
 

@@ -146,6 +146,22 @@ class TestCreateTask:
         })
         assert resp.status_code == 400
 
+    def test_rejects_too_long_duration(self, client: TestClient):
+        resp = client.post("/api/tasks", json={
+            "name": "bad", "agent_id": "a1",
+            "target_pid": 1, "collector_type": "perf_cpu",
+            "duration_sec": 121,
+        })
+        assert resp.status_code == 400
+
+    def test_rejects_too_high_sample_rate(self, client: TestClient):
+        resp = client.post("/api/tasks", json={
+            "name": "bad", "agent_id": "a1",
+            "target_pid": 1, "collector_type": "perf_cpu",
+            "sample_rate": 1000,
+        })
+        assert resp.status_code == 400
+
     def test_rejects_unknown_agent(self, client: TestClient):
         resp = client.post("/api/tasks", json={
             "name": "bad-agent", "agent_id": "missing_agent",

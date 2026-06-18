@@ -28,6 +28,8 @@ from server.app.rca.report import run_diagnosis_context
 from server.app.schemas import (
     APIResponse,
     CreateTaskRequest,
+    MAX_SAMPLE_RATE,
+    MAX_TASK_DURATION_SEC,
     RCAFeedbackRequest,
     TaskView,
 )
@@ -171,8 +173,12 @@ def list_audit_logs() -> APIResponse:
 def create_task(payload: CreateTaskRequest) -> APIResponse:
     if payload.duration_sec <= 0:
         raise HTTPException(status_code=400, detail="duration_sec 必须为正整数")
+    if payload.duration_sec > MAX_TASK_DURATION_SEC:
+        raise HTTPException(status_code=400, detail=f"duration_sec 不能超过 {MAX_TASK_DURATION_SEC}")
     if payload.sample_rate <= 0:
         raise HTTPException(status_code=400, detail="sample_rate 必须为正整数")
+    if payload.sample_rate > MAX_SAMPLE_RATE:
+        raise HTTPException(status_code=400, detail=f"sample_rate 不能超过 {MAX_SAMPLE_RATE}")
     try:
         task = repo.create_task(payload)
     except ValueError as exc:
