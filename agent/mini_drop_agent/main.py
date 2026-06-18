@@ -161,7 +161,7 @@ def _on_signal(signum, frame):
 def main() -> None:
     global _should_exit
     config = load_config()
-    conn = GrpcConnection(config.server_grpc_addr)
+    conn = GrpcConnection(config.server_grpc_addr, auth_token=config.grpc_auth_token)
 
     signal.signal(signal.SIGINT, _on_signal)
     signal.signal(signal.SIGTERM, _on_signal)

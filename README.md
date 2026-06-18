@@ -63,6 +63,14 @@ export MINI_DROP_ARTIFACT_ROOT=/tmp/mini-drop
 
 对象存储预签名 URL 只允许签发配置 bucket 下 `tasks/` 前缀的任务产物。
 
+Agent gRPC 控制面默认关闭认证，生产或公网演示建议开启：
+```bash
+export MINI_DROP_GRPC_AUTH_ENABLED=1
+export MINI_DROP_GRPC_TOKEN="$MINI_DROP_API_KEY"
+```
+
+Agent 侧配置相同的 `MINI_DROP_GRPC_TOKEN` 后会自动随 gRPC metadata 上报。
+
 ## AI Provider
 
 AI 调用兼容 OpenAI-style `chat/completions` 接口，可通过 URL + Key 接不同厂商：

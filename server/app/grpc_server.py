@@ -12,6 +12,7 @@ from typing import Any
 
 import grpc
 
+from server.app.grpc_auth import GrpcAuthInterceptor
 from server.app.generated import (
     control_pb2_grpc,
     healthcheck_pb2_grpc,
@@ -30,7 +31,7 @@ def serve(repo: Any, port: int = 50051) -> grpc.Server:
     Returns:
         grpc.Server 实例，调用方负责在进程退出时调用 server.stop()。
     """
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10), interceptors=[GrpcAuthInterceptor()])
 
     init_pb2_grpc.add_InitAgentServicer_to_server(InitAgentService(repo), server)
     healthcheck_pb2_grpc.add_HealthCheckServicer_to_server(HealthCheckService(repo), server)
@@ -46,7 +47,7 @@ def serve(repo: Any, port: int = 50051) -> grpc.Server:
 def serve_in_background(repo: Any, port: int = 50051) -> grpc.Server:
     """在后台守护线程启动 gRPC server，主线程继续执行 HTTP server。"""
 
-    grpc_server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
+    grpc_server = grpc.server(futures.ThreadPoolExecutor(max_workers=10), interceptors=[GrpcAuthInterceptor()])
 
     init_pb2_grpc.add_InitAgentServicer_to_server(InitAgentService(repo), grpc_server)
     healthcheck_pb2_grpc.add_HealthCheckServicer_to_server(HealthCheckService(repo), grpc_server)

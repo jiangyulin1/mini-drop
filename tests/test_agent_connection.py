@@ -38,6 +38,25 @@ def test_channel_is_created_lazily_and_reused(monkeypatch):
     assert channels[0][0] == "server:50051"
 
 
+def test_auth_token_wraps_channel_with_interceptor(monkeypatch):
+    raw_channel = FakeChannel()
+    intercepted = FakeChannel()
+    captured = {}
+
+    def fake_intercept_channel(channel, interceptor):
+        captured["channel"] = channel
+        captured["interceptor"] = interceptor
+        return intercepted
+
+    monkeypatch.setattr(grpc, "insecure_channel", lambda _address: raw_channel)
+    monkeypatch.setattr(grpc, "intercept_channel", fake_intercept_channel)
+    conn = GrpcConnection("server:50051", auth_token="secret")
+
+    assert conn.channel is intercepted
+    assert captured["channel"] is raw_channel
+    assert captured["interceptor"]._token == "secret"
+
+
 def test_close_resets_channel(monkeypatch):
     channel = FakeChannel()
     monkeypatch.setattr(grpc, "insecure_channel", lambda _address: channel)

@@ -13,6 +13,7 @@ class AgentConfig:
     server_grpc_addr: str
     agent_ip_addr: str
     heartbeat_interval_sec: int = 5
+    grpc_auth_token: str = ""
 
 
 def load_config() -> AgentConfig:
@@ -22,6 +23,7 @@ def load_config() -> AgentConfig:
         server_grpc_addr=server_grpc_addr,
         agent_ip_addr=_resolve_ip(server_grpc_addr),
         heartbeat_interval_sec=int(os.getenv("AGENT_HEARTBEAT_INTERVAL_SEC", "5")),
+        grpc_auth_token=os.getenv("MINI_DROP_GRPC_TOKEN", os.getenv("MINI_DROP_API_KEY", "")),
     )
 
 

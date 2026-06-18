@@ -12,7 +12,14 @@ class TestAgentConfig:
     """配置文件从环境变量读取。"""
 
     def _clean_env(self, monkeypatch):
-        for key in ("AGENT_ID", "AGENT_GRPC_ADDR", "AGENT_IP_ADDR", "AGENT_HEARTBEAT_INTERVAL_SEC"):
+        for key in (
+            "AGENT_ID",
+            "AGENT_GRPC_ADDR",
+            "AGENT_IP_ADDR",
+            "AGENT_HEARTBEAT_INTERVAL_SEC",
+            "MINI_DROP_GRPC_TOKEN",
+            "MINI_DROP_API_KEY",
+        ):
             monkeypatch.delenv(key, raising=False)
 
     def test_default_config(self, monkeypatch):
@@ -46,6 +53,19 @@ class TestAgentConfig:
         monkeypatch.setenv("AGENT_HEARTBEAT_INTERVAL_SEC", "10")
         cfg = load_config()
         assert cfg.heartbeat_interval_sec == 10
+
+    def test_grpc_token_prefers_dedicated_env(self, monkeypatch):
+        self._clean_env(monkeypatch)
+        monkeypatch.setenv("MINI_DROP_API_KEY", "api-token")
+        monkeypatch.setenv("MINI_DROP_GRPC_TOKEN", "grpc-token")
+        cfg = load_config()
+        assert cfg.grpc_auth_token == "grpc-token"
+
+    def test_grpc_token_falls_back_to_api_key(self, monkeypatch):
+        self._clean_env(monkeypatch)
+        monkeypatch.setenv("MINI_DROP_API_KEY", "api-token")
+        cfg = load_config()
+        assert cfg.grpc_auth_token == "api-token"
 
     def test_config_is_frozen(self, monkeypatch):
         self._clean_env(monkeypatch)

@@ -8,6 +8,7 @@ import json
 import threading
 import time
 import socket
+from collections import namedtuple
 from datetime import timedelta
 
 import grpc
@@ -29,6 +30,12 @@ from server.app.schemas import CreateTaskRequest
 from server.app.state_machine import Actor, TaskStatus, now_utc
 
 
+_ClientCallDetails = namedtuple(
+    "_ClientCallDetails",
+    ("method", "timeout", "metadata", "credentials", "wait_for_ready", "compression"),
+)
+
+
 def _free_port() -> int:
     """获取一个当前可用端口，避免整仓测试时固定端口冲突。"""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -42,11 +49,12 @@ TEST_PORT = 50052
 class GrpcFixture:
     """每个测试用例独立的 gRPC 环境和 stub 集合。"""
 
-    def __init__(self):
+    def __init__(self, metadata=None):
         self.port = _free_port()
         self.repo = InMemoryRepository()
         self.server = serve(self.repo, port=self.port)
-        self.channel = grpc.insecure_channel(f"localhost:{self.port}")
+        channel = grpc.insecure_channel(f"localhost:{self.port}")
+        self.channel = grpc.intercept_channel(channel, _MetadataClientInterceptor(metadata)) if metadata else channel
         self.init_stub = init_pb2_grpc.InitAgentStub(self.channel)
         self.hc_stub = healthcheck_pb2_grpc.HealthCheckStub(self.channel)
         self.hotmethod_stub = hotmethod_pb2_grpc.HotmethodStub(self.channel)
@@ -57,11 +65,59 @@ class GrpcFixture:
         self.server.stop(grace=None).wait(timeout=5)
 
 
+class _MetadataClientInterceptor(grpc.UnaryUnaryClientInterceptor):
+    def __init__(self, metadata):
+        self._metadata = tuple(metadata or ())
+
+    def intercept_unary_unary(self, continuation, client_call_details, request):
+        details = _ClientCallDetails(
+            method=client_call_details.method,
+            timeout=client_call_details.timeout,
+            metadata=tuple(client_call_details.metadata or ()) + self._metadata,
+            credentials=client_call_details.credentials,
+            wait_for_ready=client_call_details.wait_for_ready,
+            compression=client_call_details.compression,
+        )
+        return continuation(details, request)
+
+
 @pytest.fixture(name="grpc_fix")
 def grpc_fixture():
     fix = GrpcFixture()
     yield fix
     fix.close()
+
+
+class TestGrpcAuth:
+    def test_auth_disabled_allows_plain_request(self, monkeypatch):
+        monkeypatch.delenv("MINI_DROP_GRPC_AUTH_ENABLED", raising=False)
+        fix = GrpcFixture()
+        try:
+            resp = fix.init_stub.FetchConfig(init_pb2.FetchConfigRequest(agent_id="agent_auth_open"))
+            assert resp.cos_config.endpoint == ""
+        finally:
+            fix.close()
+
+    def test_auth_enabled_rejects_missing_token(self, monkeypatch):
+        monkeypatch.setenv("MINI_DROP_GRPC_AUTH_ENABLED", "1")
+        monkeypatch.setenv("MINI_DROP_GRPC_TOKEN", "secret")
+        fix = GrpcFixture()
+        try:
+            with pytest.raises(grpc.RpcError) as exc_info:
+                fix.init_stub.FetchConfig(init_pb2.FetchConfigRequest(agent_id="agent_auth_missing"))
+            assert exc_info.value.code() == grpc.StatusCode.UNAUTHENTICATED
+        finally:
+            fix.close()
+
+    def test_auth_enabled_accepts_matching_token(self, monkeypatch):
+        monkeypatch.setenv("MINI_DROP_GRPC_AUTH_ENABLED", "1")
+        monkeypatch.setenv("MINI_DROP_GRPC_TOKEN", "secret")
+        fix = GrpcFixture(metadata=(("x-mini-drop-grpc-token", "secret"),))
+        try:
+            resp = fix.init_stub.FetchConfig(init_pb2.FetchConfigRequest(agent_id="agent_auth_ok"))
+            assert resp.cos_config.endpoint == ""
+        finally:
+            fix.close()
 
 
 class TestInitAgent:
