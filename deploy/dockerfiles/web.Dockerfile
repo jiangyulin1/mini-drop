@@ -1,9 +1,9 @@
-# Mini-Drop Web 前端构建与部署
+# Mini-Drop Web frontend build and runtime image
 FROM node:20-alpine AS build
 
 WORKDIR /app
-COPY web/package.json ./
-RUN npm install
+COPY web/package.json web/package-lock.json ./
+RUN npm ci
 
 COPY web/ ./
 RUN npm run build
