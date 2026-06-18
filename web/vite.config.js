@@ -11,6 +11,12 @@ export default defineConfig({
         entryFileNames: "assets/[name]-[hash].js",
         chunkFileNames: "assets/[name]-[hash].js",
         assetFileNames: "assets/[name]-[hash][extname]",
+        manualChunks(id) {
+          if (!id.includes("node_modules")) return undefined;
+          if (id.includes("react")) return "react";
+          if (id.includes("echarts") || id.includes("d3") || id.includes("d3-flame-graph")) return "charts";
+          return undefined;
+        },
       },
     },
   },
