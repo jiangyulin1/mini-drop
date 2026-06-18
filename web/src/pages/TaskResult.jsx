@@ -153,6 +153,8 @@ export default function TaskResult() {
   const topArtifact = artifacts.find((item) => item.artifact_type === "top_json");
   const flameArtifact = artifacts.find((item) => item.artifact_type === "flamegraph_svg" || item.artifact_type === "flamegraph_json");
   const suggestionArtifact = artifacts.find((item) => item.artifact_type === "suggestions_md");
+  const continuousSummary = artifacts.find((item) => item.artifact_type === "continuous_summary");
+  const continuousWindows = continuousSummary?.metadata?.windows || [];
 
   return (
     <Space direction="vertical" size={16} style={{ width: "100%" }}>
@@ -243,6 +245,31 @@ export default function TaskResult() {
                     { title: "热点函数", dataIndex: "name" },
                     { title: "样本数", dataIndex: "samples", width: 120 },
                     { title: "占比", dataIndex: "percent", width: 160, render: (value) => <Progress percent={Math.round(value || 0)} size="small" /> },
+                  ]}
+                />
+              )}
+              {continuousWindows.length > 0 && (
+                <Table
+                  rowKey={(record) => record.window_index}
+                  dataSource={continuousWindows}
+                  pagination={false}
+                  size="small"
+                  columns={[
+                    { title: "窗口", dataIndex: "window_index", width: 90 },
+                    {
+                      title: "开始",
+                      dataIndex: "start_ts",
+                      width: 180,
+                      render: (value) => new Date((value || 0) * 1000).toLocaleString(),
+                    },
+                    {
+                      title: "结束",
+                      dataIndex: "end_ts",
+                      width: 180,
+                      render: (value) => new Date((value || 0) * 1000).toLocaleString(),
+                    },
+                    { title: "状态", dataIndex: "ok", width: 100, render: (value) => <Tag color={value ? "green" : "red"}>{value ? "OK" : "FAILED"}</Tag> },
+                    { title: "说明", dataIndex: "reason" },
                   ]}
                 />
               )}
