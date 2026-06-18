@@ -27,7 +27,6 @@ venv/
 # Node dependencies and frontend build output
 node_modules/
 web/node_modules/
-web/dist/
 web/.vite/
 
 # Local runtime data

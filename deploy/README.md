@@ -16,6 +16,24 @@ docker compose up -d
 
 启动后访问 http://localhost 打开 Web 界面。
 
+## 本地/离线 Docker 演示
+
+如果当前环境无法拉取 `node:20-alpine`、`postgres:16` 或 `minio/minio`，可以使用本地演示 override。它使用本机已构建的 `web/dist`、Server 容器内 SQLite，以及 Server/Agent 共享的 artifact volume：
+
+```bash
+npm --prefix web run build
+docker compose -f docker-compose.yml -f docker-compose.local.yml up -d --build server agent web
+```
+
+该模式用于本地验证主链路，不等同于生产部署。生产/完整演示仍建议使用默认 `docker compose up -d`，启用 PostgreSQL 和 MinIO。
+
+如果只想在拉不到 Node 镜像时复用本地前端产物，也可以只覆盖 Web 构建：
+
+```bash
+npm --prefix web run build
+docker compose -f docker-compose.yml -f docker-compose.prebuilt-web.yml build web
+```
+
 ## 一键演示
 
 ```bash
