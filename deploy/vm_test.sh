@@ -37,8 +37,13 @@ sleep 2
 DEMO_PID=$(ps -ef | grep cpu_hotspot | grep -v grep | awk '{print $2}')
 echo "Demo PID: $DEMO_PID" >> "$TEST_RESULTS"
 
-# 确保 perf_event_paranoid = 1
-echo '312q' | sudo -S sh -c 'echo 1 > /proc/sys/kernel/perf_event_paranoid' 2>/dev/null
+# 确保 perf_event_paranoid = 1。
+# 如需非交互执行，可提前设置 MINI_DROP_SUDO_PASSWORD；不要把真实密码提交到仓库。
+if [ -n "${MINI_DROP_SUDO_PASSWORD:-}" ]; then
+  printf '%s\n' "$MINI_DROP_SUDO_PASSWORD" | sudo -S sh -c 'echo 1 > /proc/sys/kernel/perf_event_paranoid' 2>/dev/null
+else
+  sudo sh -c 'echo 1 > /proc/sys/kernel/perf_event_paranoid'
+fi
 
 # 创建任务
 RESP=$(curl -s -X POST http://localhost:8191/api/tasks \
