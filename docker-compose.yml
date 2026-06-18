@@ -25,7 +25,7 @@ services:
       retries: 5
 
   minio:
-    image: minio/minio:latest
+    image: quay.io/minio/minio:latest
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: mini_drop
@@ -36,8 +36,9 @@ services:
     volumes:
       - miniodata:/data
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      test: ["CMD", "mc", "ready", "local"]
       interval: 10s
+      timeout: 5s
       retries: 5
 
   server:
@@ -49,6 +50,7 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg://mini_drop:mini_drop@postgres:5432/mini_drop
       MINIO_ENDPOINT: minio:9000
+      MINIO_PUBLIC_ENDPOINT: localhost:9000
       MINIO_BUCKET: mini-drop
       MINIO_AUTO_CREATE_BUCKET: "1"
       MINI_DROP_GRPC_AUTH_ENABLED: "0"

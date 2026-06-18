@@ -1,8 +1,4 @@
-"""MinIO 存储层伪造服务测试。
-
-在没有真实 MinIO 的环境中通过 mock 验证 storage 模块的行为，
-确保凭证读取、bucket 检查和 URL 生成逻辑正确。
-"""
+"""Tests for MinIO storage helpers."""
 
 from unittest import mock
 
@@ -76,5 +72,34 @@ class TestPresignedUrl:
             assert kwargs["expires"].total_seconds() == 3600
 
     def test_rejects_invalid_expires(self):
-        with pytest.raises(ValueError, match="expires 必须在 1 秒到 7 天之间"):
+        with pytest.raises(ValueError, match="expires must be between"):
             store.presigned_get_url("b", "k", expires=0)
+
+    def test_uses_public_endpoint_for_presigned_url(self, monkeypatch):
+        monkeypatch.setenv("MINIO_PUBLIC_ENDPOINT", "http://localhost:9000")
+        monkeypatch.delenv("MINIO_PUBLIC_SECURE", raising=False)
+
+        with mock.patch.object(store, "_client") as mock_client:
+            mock_client.return_value.presigned_get_object.return_value = (
+                "http://localhost:9000/bucket/key?token=xyz"
+            )
+            url = store.presigned_get_url("bucket", "key")
+
+        assert url.startswith("http://localhost:9000")
+        _, kwargs = mock_client.call_args
+        assert kwargs["endpoint"] == "localhost:9000"
+        assert kwargs["secure"] is False
+
+    def test_https_public_endpoint_infers_secure_client(self, monkeypatch):
+        monkeypatch.setenv("MINIO_PUBLIC_ENDPOINT", "https://objects.example.com")
+        monkeypatch.delenv("MINIO_PUBLIC_SECURE", raising=False)
+
+        with mock.patch.object(store, "_client") as mock_client:
+            mock_client.return_value.presigned_get_object.return_value = (
+                "https://objects.example.com/bucket/key?token=xyz"
+            )
+            store.presigned_get_url("bucket", "key")
+
+        _, kwargs = mock_client.call_args
+        assert kwargs["endpoint"] == "objects.example.com"
+        assert kwargs["secure"] is True

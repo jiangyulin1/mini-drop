@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient
 
 from server.app import storage as store
 from server.app.database import init_db, reset_engine
-from server.app.main import app, repo
+from server.app.main import _ensure_minio_bucket_with_retry, app, repo
 from server.app.models import Base
 from server.app.state_machine import Actor, TaskStatus
 
@@ -59,6 +59,33 @@ class TestHealthz:
         resp = client.get("/api/me")
         assert resp.status_code == 200
         assert resp.json()["data"]["user_id"] == "demo_user"
+
+
+class TestStartupMinio:
+    def test_bucket_init_retries_transient_failure(self, monkeypatch):
+        calls = {"count": 0}
+
+        def flaky_ensure(bucket: str) -> None:
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise RuntimeError("not ready")
+            assert bucket == "mini-drop"
+
+        monkeypatch.setenv("MINI_DROP_MINIO_READY_RETRIES", "2")
+        monkeypatch.setenv("MINI_DROP_MINIO_READY_DELAY_SEC", "0")
+        monkeypatch.setattr(store, "ensure_bucket", flaky_ensure)
+
+        _ensure_minio_bucket_with_retry("mini-drop")
+
+        assert calls["count"] == 2
+
+    def test_bucket_init_raises_after_retry_exhausted(self, monkeypatch):
+        monkeypatch.setenv("MINI_DROP_MINIO_READY_RETRIES", "2")
+        monkeypatch.setenv("MINI_DROP_MINIO_READY_DELAY_SEC", "0")
+        monkeypatch.setattr(store, "ensure_bucket", lambda bucket: (_ for _ in ()).throw(RuntimeError("down")))
+
+        with pytest.raises(RuntimeError, match="down"):
+            _ensure_minio_bucket_with_retry("mini-drop")
 
 
 class TestApiAuth:

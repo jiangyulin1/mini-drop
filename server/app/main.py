@@ -48,10 +48,36 @@ async def _lifespan(_app: FastAPI):
     """应用生命周期：启动时拉起 gRPC，关闭时停止。"""
     init_db()
     if os.getenv("MINIO_AUTO_CREATE_BUCKET", "0") == "1":
-        store.ensure_bucket(os.getenv("MINIO_BUCKET", "mini-drop"))
+        _ensure_minio_bucket_with_retry(os.getenv("MINIO_BUCKET", "mini-drop"))
     _grpc = serve_in_background(repo)
     yield
     _grpc.stop(grace=None).wait(timeout=5)
+
+
+def _ensure_minio_bucket_with_retry(bucket: str) -> None:
+    attempts = max(1, int(os.getenv("MINI_DROP_MINIO_READY_RETRIES", "5")))
+    delay_sec = max(0.0, float(os.getenv("MINI_DROP_MINIO_READY_DELAY_SEC", "1")))
+    last_exc: Exception | None = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            store.ensure_bucket(bucket)
+            return
+        except Exception as exc:
+            last_exc = exc
+            log_event(
+                "warning",
+                "minio_bucket_init_retry",
+                bucket=bucket,
+                attempt=attempt,
+                attempts=attempts,
+                error=type(exc).__name__,
+            )
+            if attempt < attempts and delay_sec > 0:
+                time.sleep(delay_sec)
+
+    assert last_exc is not None
+    raise last_exc
 
 
 app = FastAPI(title="Mini-Drop Server", version="0.1.0", lifespan=_lifespan)
