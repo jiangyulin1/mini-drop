@@ -23,6 +23,8 @@ def _reset_repo(monkeypatch):
     """每个测试使用独立 SQLite 内存库，确保用例间无状态交叉。"""
     monkeypatch.setenv("DATABASE_URL", "sqlite:///:memory:")
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.delenv("MINI_DROP_API_AUTH_ENABLED", raising=False)
+    monkeypatch.delenv("MINI_DROP_API_KEY", raising=False)
     reset_engine()
     init_db()
     repo._task_queues.clear()
@@ -56,6 +58,36 @@ class TestHealthz:
         resp = client.get("/api/me")
         assert resp.status_code == 200
         assert resp.json()["data"]["user_id"] == "demo_user"
+
+
+class TestApiAuth:
+    def test_auth_disabled_by_default(self, client: TestClient):
+        resp = client.get("/api/tasks")
+        assert resp.status_code == 200
+
+    def test_auth_enabled_rejects_missing_token(self, client: TestClient, monkeypatch):
+        monkeypatch.setenv("MINI_DROP_API_AUTH_ENABLED", "1")
+        monkeypatch.setenv("MINI_DROP_API_KEY", "secret-token")
+        resp = client.get("/api/tasks")
+        assert resp.status_code == 401
+
+    def test_auth_enabled_accepts_bearer_token(self, client: TestClient, monkeypatch):
+        monkeypatch.setenv("MINI_DROP_API_AUTH_ENABLED", "1")
+        monkeypatch.setenv("MINI_DROP_API_KEY", "secret-token")
+        resp = client.get("/api/tasks", headers={"Authorization": "Bearer secret-token"})
+        assert resp.status_code == 200
+
+    def test_auth_enabled_accepts_x_api_key(self, client: TestClient, monkeypatch):
+        monkeypatch.setenv("MINI_DROP_API_AUTH_ENABLED", "1")
+        monkeypatch.setenv("MINI_DROP_API_KEY", "secret-token")
+        resp = client.get("/api/tasks", headers={"X-API-Key": "secret-token"})
+        assert resp.status_code == 200
+
+    def test_healthz_stays_public_when_auth_enabled(self, client: TestClient, monkeypatch):
+        monkeypatch.setenv("MINI_DROP_API_AUTH_ENABLED", "1")
+        monkeypatch.setenv("MINI_DROP_API_KEY", "secret-token")
+        resp = client.get("/api/healthz")
+        assert resp.status_code == 200
 
 
 class TestCreateTask:

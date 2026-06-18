@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import json as _json_mod
 import os
+import secrets
 from contextlib import asynccontextmanager
 from pathlib import Path as _Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 
 from server.app.database import init_db
 from server.app.grpc_server import serve_in_background
@@ -51,6 +53,21 @@ async def _lifespan(_app: FastAPI):
 app = FastAPI(title="Mini-Drop Server", version="0.1.0", lifespan=_lifespan)
 
 
+@app.middleware("http")
+async def _api_key_auth(request: Request, call_next):
+    if _requires_api_auth(request):
+        expected = os.getenv("MINI_DROP_API_KEY", "")
+        token = _extract_api_token(request)
+        if not expected:
+            return JSONResponse(
+                status_code=500,
+                content={"detail": "API auth enabled but MINI_DROP_API_KEY is empty"},
+            )
+        if not token or not secrets.compare_digest(token, expected):
+            return JSONResponse(status_code=401, content={"detail": "无效 API Key"})
+    return await call_next(request)
+
+
 def _task_view(record) -> TaskView:
     """将 TaskRecord 转为前端模型。"""
     return TaskView(
@@ -68,6 +85,20 @@ def _task_view(record) -> TaskView:
         started_at=record.started_at,
         finished_at=record.finished_at,
     )
+
+
+def _requires_api_auth(request: Request) -> bool:
+    if os.getenv("MINI_DROP_API_AUTH_ENABLED", "0").strip().lower() not in {"1", "true", "yes", "on"}:
+        return False
+    path = request.url.path
+    return path.startswith("/api/") and path != "/api/healthz"
+
+
+def _extract_api_token(request: Request) -> str | None:
+    auth = request.headers.get("authorization", "")
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    return request.headers.get("x-api-key")
 
 
 # ── 通用 ──────────────────────────────────────────────────────
