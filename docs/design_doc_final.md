@@ -122,6 +122,8 @@ Agent 采集期间自身开销：
 
 数据来源：Agent 心跳中上报的 PidStats（读取 /proc/self/stat + /proc/self/io）。
 
+前端构建采用路由懒加载，任务详情页和审计页按需加载；Vite 将 React 与图表依赖拆分为独立 chunk，降低首屏业务包体积。Ant Design 仍是当前最大 vendor 体积来源，后续可继续做组件级按需优化。
+
 ## 9. 安全加固补充
 
 ### 9.1 HTTP API Key 认证
@@ -162,3 +164,33 @@ MINI_DROP_ARTIFACT_ROOT=/tmp/mini-drop
 - API Key 是全局共享密钥，后续应升级为用户级 token 或接入真实鉴权系统。
 - 产物元数据仍由 Agent 上报，当前只做白名单清洗；后续应增加上传侧签名校验。
 - 多租户、任务权限、审计查询权限尚未实现，当前版本定位为单租户 Mini-Drop MVP。
+
+## 10. 工程化补充
+
+### 10.1 结构化日志
+
+Server 和 Agent 均输出 JSON Lines 风格日志，便于 Docker 日志收集和后续接入 Loki / ELK：
+
+- Server HTTP 访问日志：`event=http_request`，包含 method、path、status_code、latency_ms。
+- Server 异常访问日志：`event=http_request_failed`，包含异常类型和耗时。
+- Agent 运行日志：注册、心跳失败、任务拉取、任务完成、任务失败、结果上报失败均有结构化事件。
+
+### 10.2 构建与验收命令
+
+容器镜像构建不再依赖隐藏 fallback：Server 镜像先复制源码再执行 `pip install -e .`，Web 镜像使用 `npm ci` 基于 lockfile 安装依赖。
+
+常用验收命令：
+
+```bash
+make test
+make coverage
+npm --prefix web run build
+docker compose up -d
+make demo
+```
+
+其中 `make coverage` 需要先安装 dev 依赖：
+
+```bash
+pip install -e ".[dev]"
+```
