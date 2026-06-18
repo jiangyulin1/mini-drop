@@ -217,6 +217,7 @@ class SqlRepository:
                     created_at=ts,
                 )
                 session.add(task)
+                session.flush()
 
                 # 状态事件
                 self._write_event(session, task_id, None, TaskStatus.PENDING,

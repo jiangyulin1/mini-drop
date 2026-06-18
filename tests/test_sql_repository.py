@@ -125,6 +125,35 @@ class TestTaskPersistence:
         assert task.status == TaskStatus.PENDING.value
         assert task.id
 
+    def test_create_task_flushes_task_before_status_event(self, repo: SqlRepository, monkeypatch):
+        repo.register_agent(self.AGENT_ID, "h", self.IP)
+
+        from sqlalchemy.orm import Session
+
+        original_flush = Session.flush
+        flushed = False
+
+        def spy_flush(self, *args, **kwargs):
+            nonlocal flushed
+            flushed = True
+            return original_flush(self, *args, **kwargs)
+
+        original_write_event = repo._write_event
+
+        def assert_task_flushed_before_event(*args, **kwargs):
+            assert flushed
+            return original_write_event(*args, **kwargs)
+
+        monkeypatch.setattr(Session, "flush", spy_flush)
+        monkeypatch.setattr(repo, "_write_event", assert_task_flushed_before_event)
+
+        task = repo.create_task(CreateTaskRequest(
+            name="pg-fk-order", agent_id=self.AGENT_ID,
+            target_pid=101, collector_type="perf_cpu",
+        ))
+
+        assert task.status == TaskStatus.PENDING.value
+
     def test_create_task_requires_registered_agent(self, repo: SqlRepository):
         with pytest.raises(ValueError, match="Agent missing_agent 不存在"):
             repo.create_task(CreateTaskRequest(
