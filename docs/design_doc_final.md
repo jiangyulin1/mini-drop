@@ -154,10 +154,11 @@ MINI_DROP_ARTIFACT_ROOT=/tmp/mini-drop
 - 绝对路径必须仍位于 `MINI_DROP_ARTIFACT_ROOT` 内。
 - `resolve()` 后逃逸根目录的路径会被拒绝，包含符号链接逃逸场景。
 - 预签名 URL 只允许配置 bucket，且 object key 必须位于 `tasks/` 目录下。
+- Agent 通过 gRPC 上报的 artifact metadata 会先经过白名单清洗，最多保留 32 个产物，超长字段会截断，嵌套 metadata 不会落库。
 
 ### 9.3 剩余安全工作
 
 - gRPC 仍为 insecure channel，后续应增加可选 TLS / mTLS。
 - API Key 是全局共享密钥，后续应升级为用户级 token 或接入真实鉴权系统。
-- 产物元数据仍由 Agent 上报，后续应增加 artifact schema 校验和上传侧签名校验。
+- 产物元数据仍由 Agent 上报，当前只做白名单清洗；后续应增加上传侧签名校验。
 - 多租户、任务权限、审计查询权限尚未实现，当前版本定位为单租户 Mini-Drop MVP。
