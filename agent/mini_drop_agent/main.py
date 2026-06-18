@@ -27,6 +27,7 @@ from agent.mini_drop_agent.collectors.perf import PerfCollector
 from agent.mini_drop_agent.collectors.pyspy import PySpyCollector
 from agent.mini_drop_agent.connection import GrpcConnection
 from agent.mini_drop_agent.config import AgentConfig, load_config
+from agent.mini_drop_agent.logging_utils import log_event
 from server.app.generated import (
     healthcheck_pb2,
     healthcheck_pb2_grpc,
@@ -166,7 +167,7 @@ def main() -> None:
     signal.signal(signal.SIGTERM, _on_signal)
 
     _register(init_pb2_grpc.InitAgentStub(conn.channel), config)
-    print(f"[agent] 注册成功 agent_id={config.agent_id}")
+    log_event("info", "agent_registered", agent_id=config.agent_id, ip_addr=config.agent_ip_addr)
 
     while not _should_exit:
         try:
@@ -174,7 +175,7 @@ def main() -> None:
                 lambda: _heartbeat(healthcheck_pb2_grpc.HealthCheckStub(conn.channel), config)
             )
         except grpc.RpcError as exc:
-            print(f"[agent] 心跳失败: {exc.code()} {exc.details()}")
+            log_event("error", "heartbeat_failed", code=exc.code(), details=exc.details())
             time.sleep(config.heartbeat_interval_sec)
             continue
 
@@ -182,7 +183,13 @@ def main() -> None:
             time.sleep(config.heartbeat_interval_sec)
             continue
 
-        print(f"[agent] 拉取任务 task_id={task['id']} collector={task['collector_type']} pid={task['target_pid']}")
+        log_event(
+            "info",
+            "task_pulled",
+            task_id=task["id"],
+            collector=task["collector_type"],
+            pid=task["target_pid"],
+        )
         ok, reason, artifacts = _run_collector(task)
 
         try:
@@ -196,13 +203,13 @@ def main() -> None:
                 )
             )
         except grpc.RpcError as exc:
-            print(f"[agent] 上报结果失败: {exc.code()} {exc.details()}")
+            log_event("error", "notify_result_failed", task_id=task["id"], code=exc.code(), details=exc.details())
             continue
 
         if ok:
-            print(f"[agent] 任务完成 task_id={task['id']}")
+            log_event("info", "task_completed", task_id=task["id"], artifact_count=len(artifacts))
         else:
-            print(f"[agent] 任务失败 task_id={task['id']} reason={reason}")
+            log_event("error", "task_failed", task_id=task["id"], reason=reason)
 
         time.sleep(config.heartbeat_interval_sec)
 
