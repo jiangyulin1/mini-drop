@@ -1,6 +1,6 @@
 PYTHON ?= $(if $(wildcard .venv/bin/python),.venv/bin/python,python)
 
-.PHONY: server agent analyzer test lint demo proto deploy deploy-down
+.PHONY: server agent analyzer test coverage lint demo proto deploy deploy-down
 
 proto:
 	cd proto && bash compile.sh
@@ -18,6 +18,9 @@ analyzer:
 
 test:
 	$(PYTHON) -m pytest tests -v
+
+coverage:
+	$(PYTHON) -m pytest --cov=server --cov=agent --cov=analyzer --cov-report=term-missing tests
 
 lint:
 	$(PYTHON) -m compileall server agent analyzer demo

@@ -25,11 +25,43 @@ docker compose up -d
 make demo
 ```
 
+验收：
+```bash
+make test
+make coverage    # 需要先安装 dev 依赖: pip install -e ".[dev]"
+npm --prefix web run build
+```
+
 ## 环境要求
 
 - Ubuntu 22.04 / Docker Compose v2
 - Agent 容器需要 privileged + pid:host（perf / bpftrace 权限）
 - 可选：DEEPSEEK_API_KEY（启用 AI 归因和自然语言采集）
+
+## 安全开关
+
+开发和本地 demo 默认关闭认证。生产或公网演示建议开启 API Key：
+
+```bash
+export MINI_DROP_API_AUTH_ENABLED=1
+export MINI_DROP_API_KEY="$(openssl rand -hex 32)"
+```
+
+开启后，除 `/api/healthz` 外的 API 都需要携带：
+
+```bash
+Authorization: Bearer <token>
+# 或
+X-API-Key: <token>
+```
+
+Server 只允许读取受控目录下的本地产物，默认根目录为 `/tmp/mini-drop`：
+
+```bash
+export MINI_DROP_ARTIFACT_ROOT=/tmp/mini-drop
+```
+
+对象存储预签名 URL 只允许签发配置 bucket 下 `tasks/` 前缀的任务产物。
 
 ## AI Provider
 
