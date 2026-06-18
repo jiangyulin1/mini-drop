@@ -11,6 +11,7 @@ from __future__ import annotations
 import json as _json_mod
 import os
 import secrets
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path as _Path
 
@@ -19,6 +20,7 @@ from fastapi.responses import JSONResponse
 
 from server.app.database import init_db
 from server.app.grpc_server import serve_in_background
+from server.app.logging_utils import log_event
 from server.app.nlp.intent_parser import parse_intent
 from server.app.nlp.process_resolver import resolve_pid
 from server.app.nlp.summarizer import summarize, suggest_followup
@@ -51,6 +53,33 @@ async def _lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="Mini-Drop Server", version="0.1.0", lifespan=_lifespan)
+
+
+@app.middleware("http")
+async def _access_log(request: Request, call_next):
+    start = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception as exc:
+        log_event(
+            "error",
+            "http_request_failed",
+            method=request.method,
+            path=request.url.path,
+            error=type(exc).__name__,
+            latency_ms=round((time.perf_counter() - start) * 1000, 2),
+        )
+        raise
+
+    log_event(
+        "info",
+        "http_request",
+        method=request.method,
+        path=request.url.path,
+        status_code=response.status_code,
+        latency_ms=round((time.perf_counter() - start) * 1000, 2),
+    )
+    return response
 
 
 @app.middleware("http")
