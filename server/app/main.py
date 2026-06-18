@@ -157,19 +157,17 @@ def get_task_artifact_content(task_id: str, artifact_type: str) -> APIResponse:
         if artifact.get("artifact_type") != artifact_type:
             continue
         local_path = artifact.get("local_path")
-        if not local_path or not os.path.isfile(local_path):
-            raise HTTPException(status_code=404, detail="本地产物不存在")
+        path = _resolve_artifact_path(local_path)
         if artifact_type.endswith("_json") or artifact.get("content_type") == "application/json":
-            return APIResponse(data=_json_mod.loads(_Path(local_path).read_text(encoding="utf-8")))
-        return APIResponse(data={"text": _Path(local_path).read_text(encoding="utf-8", errors="replace")})
+            return APIResponse(data=_json_mod.loads(path.read_text(encoding="utf-8")))
+        return APIResponse(data={"text": path.read_text(encoding="utf-8", errors="replace")})
     raise HTTPException(status_code=404, detail="产物不存在")
 
 
 @app.get("/api/storage/presign")
 def presign_url(bucket: str = "mini-drop", key: str = "", expires: int = 3600) -> APIResponse:
     """生成 MinIO 预签名下载 URL。"""
-    if not key:
-        raise HTTPException(status_code=400, detail="key 参数不能为空")
+    key = _validate_presign_request(bucket, key)
     try:
         url = store.presigned_get_url(bucket, key, expires)
     except ValueError as exc:
@@ -304,12 +302,47 @@ def _extract_artifact_json(artifacts: list[dict], artifact_type: str) -> dict | 
     for art in artifacts:
         if art.get("artifact_type") == artifact_type:
             local_path = art.get("local_path", "")
-            if local_path and os.path.isfile(local_path):
-                try:
-                    return _json_mod.loads(_Path(local_path).read_text(encoding="utf-8"))
-                except Exception:
-                    return None
+            try:
+                path = _resolve_artifact_path(local_path)
+                return _json_mod.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                return None
     return None
+
+
+def _artifact_root() -> _Path:
+    return _Path(os.getenv("MINI_DROP_ARTIFACT_ROOT", "/tmp/mini-drop")).expanduser().resolve()
+
+
+def _resolve_artifact_path(local_path: str | None) -> _Path:
+    if not local_path:
+        raise HTTPException(status_code=404, detail="本地产物不存在")
+
+    root = _artifact_root()
+    candidate = _Path(local_path).expanduser()
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    resolved = candidate.resolve()
+
+    if not resolved.is_relative_to(root):
+        raise HTTPException(status_code=403, detail="产物路径不在允许目录内")
+    if not resolved.is_file():
+        raise HTTPException(status_code=404, detail="本地产物不存在")
+    return resolved
+
+
+def _validate_presign_request(bucket: str, key: str) -> str:
+    allowed_bucket = os.getenv("MINIO_BUCKET", "mini-drop")
+    if bucket != allowed_bucket:
+        raise HTTPException(status_code=403, detail="bucket 不在允许范围内")
+    if not key:
+        raise HTTPException(status_code=400, detail="key 参数不能为空")
+    normalized = key.replace("\\", "/")
+    if normalized.startswith("/") or any(part in {"", ".", ".."} for part in normalized.split("/")):
+        raise HTTPException(status_code=400, detail="key 路径不合法")
+    if not normalized.startswith("tasks/"):
+        raise HTTPException(status_code=403, detail="key 不在任务产物目录内")
+    return normalized
 
 
 # ── NLP 自然语言采集 ────────────────────────────────────────────

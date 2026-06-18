@@ -206,7 +206,8 @@ class TestTaskArtifacts:
         assert len(arts) == 1
         assert arts[0]["artifact_type"] == "raw"
 
-    def test_artifact_content_reads_local_json(self, client: TestClient, tmp_path):
+    def test_artifact_content_reads_local_json(self, client: TestClient, tmp_path, monkeypatch):
+        monkeypatch.setenv("MINI_DROP_ARTIFACT_ROOT", str(tmp_path))
         top_path = tmp_path / "top.json"
         top_path.write_text('[{"name":"fib_hotspot","samples":10,"percent":80.0}]', encoding="utf-8")
         resp = client.post("/api/tasks", json={
@@ -224,6 +225,27 @@ class TestTaskArtifacts:
         content = client.get(f"/api/tasks/{task_id}/artifacts/top_json/content")
         assert content.status_code == 200
         assert content.json()["data"][0]["name"] == "fib_hotspot"
+
+    def test_artifact_content_rejects_path_outside_root(self, client: TestClient, tmp_path, monkeypatch):
+        root = tmp_path / "artifacts"
+        outside = tmp_path / "outside.json"
+        root.mkdir()
+        outside.write_text('{"secret": true}', encoding="utf-8")
+        monkeypatch.setenv("MINI_DROP_ARTIFACT_ROOT", str(root))
+        resp = client.post("/api/tasks", json={
+            "name": "art-content-forbidden", "agent_id": "a1",
+            "target_pid": 1, "collector_type": "perf_cpu",
+        })
+        task_id = resp.json()["data"]["task_id"]
+        repo.add_artifacts(task_id, [{
+            "artifact_type": "top_json",
+            "filename": "top.json",
+            "local_path": str(outside),
+            "content_type": "application/json",
+        }])
+
+        content = client.get(f"/api/tasks/{task_id}/artifacts/top_json/content")
+        assert content.status_code == 403
 
 
 class TestStoragePresign:
@@ -246,6 +268,27 @@ class TestStoragePresign:
     def test_presign_rejects_empty_key(self, client: TestClient):
         resp = client.get("/api/storage/presign", params={"bucket": "mini-drop"})
         assert resp.status_code == 400
+
+    def test_presign_rejects_unallowed_bucket(self, client: TestClient):
+        resp = client.get("/api/storage/presign", params={
+            "bucket": "other-bucket",
+            "key": "tasks/demo/flamegraph.svg",
+        })
+        assert resp.status_code == 403
+
+    def test_presign_rejects_path_traversal_key(self, client: TestClient):
+        resp = client.get("/api/storage/presign", params={
+            "bucket": "mini-drop",
+            "key": "tasks/../secret.txt",
+        })
+        assert resp.status_code == 400
+
+    def test_presign_rejects_key_outside_task_artifacts(self, client: TestClient):
+        resp = client.get("/api/storage/presign", params={
+            "bucket": "mini-drop",
+            "key": "public/demo.svg",
+        })
+        assert resp.status_code == 403
 
     def test_presign_rejects_invalid_expires(self, client: TestClient):
         resp = client.get("/api/storage/presign", params={
