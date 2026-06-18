@@ -36,14 +36,14 @@ class PySpyCollector:
         os.makedirs(output_dir, exist_ok=True)
         svg_path = os.path.join(output_dir, "pyspy.svg")
 
-        cmd = [
+        base_cmd = [
             pyspy, "record",
             "-p", str(task.target_pid),
             "-d", str(task.duration_sec),
             "-r", str(task.sample_rate),
             "-o", svg_path,
-            "--native",  # 同时显示 C 扩展调用帧
         ]
+        cmd = base_cmd + ["--native"]  # 同时显示 C 扩展调用帧
 
         timeout = task.duration_sec + 30
 
@@ -63,6 +63,24 @@ class PySpyCollector:
                 ok=False,
                 reason=f"py-spy 异常: {exc}",
             )
+
+        if proc.returncode != 0 and self._should_retry_without_native(proc.stderr):
+            try:
+                proc = subprocess.run(
+                    base_cmd,
+                    capture_output=True,
+                    timeout=timeout,
+                )
+            except subprocess.TimeoutExpired:
+                return CollectorResult(
+                    ok=False,
+                    reason=f"py-spy 降级重试超时 (>{timeout}s)",
+                )
+            except Exception as exc:
+                return CollectorResult(
+                    ok=False,
+                    reason=f"py-spy 降级重试异常: {exc}",
+                )
 
         if proc.returncode != 0:
             err = proc.stderr.decode("utf-8", errors="replace").strip()
@@ -95,3 +113,8 @@ class PySpyCollector:
     @staticmethod
     def _pid_exists(pid: int) -> bool:
         return os.path.isdir(f"/proc/{pid}")
+
+    @staticmethod
+    def _should_retry_without_native(stderr: bytes) -> bool:
+        text = stderr.decode("utf-8", errors="replace")
+        return "UNW_EBADREG" in text or "bad register number" in text
