@@ -365,7 +365,23 @@ def _extract_artifact_json(artifacts: list[dict], artifact_type: str) -> dict | 
             try:
                 path = _resolve_artifact_path(local_path)
                 return _json_mod.loads(path.read_text(encoding="utf-8"))
-            except Exception:
+            except HTTPException as exc:
+                log_event(
+                    "warning",
+                    "artifact_json_unavailable",
+                    artifact_type=artifact_type,
+                    local_path=local_path,
+                    status_code=exc.status_code,
+                )
+                return None
+            except Exception as exc:
+                log_event(
+                    "warning",
+                    "artifact_json_parse_failed",
+                    artifact_type=artifact_type,
+                    local_path=local_path,
+                    error=type(exc).__name__,
+                )
                 return None
     return None
 
