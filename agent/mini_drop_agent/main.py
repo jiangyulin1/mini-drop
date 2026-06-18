@@ -16,6 +16,7 @@ import os
 import signal
 import socket
 import time
+from dataclasses import replace
 from typing import Any
 
 import grpc
@@ -97,6 +98,23 @@ def _register(stub: init_pb2_grpc.InitAgentStub, config: AgentConfig) -> None:
             capabilities=CAPABILITIES,
         ),
         timeout=5,
+    )
+
+
+def _fetch_config(stub: init_pb2_grpc.InitAgentStub, config: AgentConfig) -> AgentConfig:
+    resp = stub.FetchConfig(init_pb2.FetchConfigRequest(agent_id=config.agent_id), timeout=5)
+    return _apply_cos_config(config, resp.cos_config)
+
+
+def _apply_cos_config(config: AgentConfig, cos_config) -> AgentConfig:
+    if not getattr(cos_config, "endpoint", ""):
+        return config
+    return replace(
+        config,
+        minio_endpoint=cos_config.endpoint,
+        minio_access_key=cos_config.access_key or config.minio_access_key,
+        minio_secret_key=cos_config.secret_key or config.minio_secret_key,
+        minio_bucket=cos_config.bucket or config.minio_bucket,
     )
 
 
@@ -183,7 +201,9 @@ def main() -> None:
     signal.signal(signal.SIGINT, _on_signal)
     signal.signal(signal.SIGTERM, _on_signal)
 
-    _register(init_pb2_grpc.InitAgentStub(conn.channel), config)
+    init_stub = init_pb2_grpc.InitAgentStub(conn.channel)
+    _register(init_stub, config)
+    config = _fetch_config(init_stub, config)
     log_event("info", "agent_registered", agent_id=config.agent_id, ip_addr=config.agent_ip_addr)
 
     while not _should_exit:

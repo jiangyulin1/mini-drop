@@ -5,7 +5,8 @@ from dataclasses import FrozenInstanceError
 import pytest
 
 from agent.mini_drop_agent.config import load_config
-from agent.mini_drop_agent.main import CAPABILITIES, COLLECTORS, _run_collector
+from agent.mini_drop_agent.main import CAPABILITIES, COLLECTORS, _apply_cos_config, _run_collector
+from server.app.generated import common_pb2
 
 
 class TestAgentConfig:
@@ -87,6 +88,23 @@ class TestAgentConfig:
         cfg = load_config()
         with pytest.raises(FrozenInstanceError):
             cfg.agent_id = "hacked"
+
+    def test_apply_cos_config_updates_minio_fields(self, monkeypatch):
+        self._clean_env(monkeypatch)
+        cfg = load_config()
+        updated = _apply_cos_config(
+            cfg,
+            common_pb2.CosConfig(
+                endpoint="server-minio:9000",
+                access_key="server-ak",
+                secret_key="server-sk",
+                bucket="server-bucket",
+            ),
+        )
+        assert updated.minio_endpoint == "server-minio:9000"
+        assert updated.minio_access_key == "server-ak"
+        assert updated.minio_secret_key == "server-sk"
+        assert updated.minio_bucket == "server-bucket"
 
 
 class TestAgentCollectorDispatch:
