@@ -1,4 +1,4 @@
-PYTHON ?= $(if $(wildcard .venv/bin/python),.venv/bin/python,python)
+PYTHON ?= $(if $(wildcard .venv/bin/python),.venv/bin/python,$(if $(wildcard .venv/Scripts/python.exe),.venv/Scripts/python.exe,python))
 
 .PHONY: server agent analyzer test coverage lint demo proto deploy deploy-down
 
