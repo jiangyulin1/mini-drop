@@ -75,9 +75,10 @@ class TestContinuousExecution:
 
         assert result.ok is True
         has_window = any(a["artifact_type"] == "continuous_window" for a in result.artifacts)
-        has_summary = any(a["artifact_type"] == "continuous_summary" for a in result.artifacts)
+        summary = next(a for a in result.artifacts if a["artifact_type"] == "continuous_summary")
         assert has_window
-        assert has_summary
+        assert os.path.isfile(summary["local_path"])
+        assert summary["size_bytes"] > 0
 
     def test_zero_ok_windows_returns_failure(self, collector, task, tmp_path):
         """所有窗口都失败 → 返回 False。"""

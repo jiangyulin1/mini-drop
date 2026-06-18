@@ -64,6 +64,20 @@ def upload_file(local_path: str, bucket: str, object_key: str, content_type: str
     return size
 
 
+def read_object_bytes(bucket: str, object_key: str) -> bytes:
+    """Read a complete object from MinIO."""
+    if not bucket:
+        raise ValueError("bucket 名称不能为空")
+    if not object_key:
+        raise ValueError("object_key 不能为空")
+    response = _client().get_object(bucket, object_key)
+    try:
+        return response.read()
+    finally:
+        response.close()
+        response.release_conn()
+
+
 def presigned_get_url(bucket: str, object_key: str, expires: int = 3600) -> str:
     """生成预签名下载 URL。
 

@@ -25,6 +25,7 @@ from agent.mini_drop_agent.collectors.continuous import ContinuousCollector
 from agent.mini_drop_agent.collectors.ebpf import EBPFCollector
 from agent.mini_drop_agent.collectors.perf import PerfCollector
 from agent.mini_drop_agent.collectors.pyspy import PySpyCollector
+from agent.mini_drop_agent.artifact_upload import maybe_upload_artifacts
 from agent.mini_drop_agent.connection import GrpcConnection
 from agent.mini_drop_agent.config import AgentConfig, load_config
 from agent.mini_drop_agent.logging_utils import log_event
@@ -53,7 +54,7 @@ CAPABILITIES = sorted(COLLECTORS.keys())
 # ── 任务执行 ───────────────────────────────────────────────────────
 
 
-def _run_collector(task_payload: dict[str, Any]) -> tuple[bool, str, list[dict[str, Any]]]:
+def _run_collector(task_payload: dict[str, Any], config: AgentConfig | None = None) -> tuple[bool, str, list[dict[str, Any]]]:
     """执行采集任务：构造 CollectorTask 后分发到注册的采集器。
 
     如果 collector_type 不在 COLLECTORS 中，明确上报失败。
@@ -72,7 +73,13 @@ def _run_collector(task_payload: dict[str, Any]) -> tuple[bool, str, list[dict[s
         options=task_payload.get("request_params", {}).get("options", {}),
     )
     result = collector.collect(collector_task)
-    return result.ok, result.reason, result.artifacts
+    artifacts = result.artifacts
+    if result.ok and config is not None:
+        try:
+            artifacts = maybe_upload_artifacts(task_payload["id"], result.artifacts, config)
+        except Exception as exc:
+            return False, f"artifact upload failed: {exc}", result.artifacts
+    return result.ok, result.reason, artifacts
 
 
 # ── gRPC 客户端 ───────────────────────────────────────────────────
@@ -200,7 +207,7 @@ def main() -> None:
             collector=task["collector_type"],
             pid=task["target_pid"],
         )
-        ok, reason, artifacts = _run_collector(task)
+        ok, reason, artifacts = _run_collector(task, config)
 
         try:
             conn.call_with_retry(

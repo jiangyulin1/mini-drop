@@ -19,6 +19,11 @@ class TestAgentConfig:
             "AGENT_HEARTBEAT_INTERVAL_SEC",
             "MINI_DROP_GRPC_TOKEN",
             "MINI_DROP_API_KEY",
+            "AGENT_UPLOAD_ARTIFACTS",
+            "MINIO_ENDPOINT",
+            "MINIO_ACCESS_KEY",
+            "MINIO_SECRET_KEY",
+            "MINIO_BUCKET",
         ):
             monkeypatch.delenv(key, raising=False)
 
@@ -66,6 +71,16 @@ class TestAgentConfig:
         monkeypatch.setenv("MINI_DROP_API_KEY", "api-token")
         cfg = load_config()
         assert cfg.grpc_auth_token == "api-token"
+
+    def test_minio_upload_config(self, monkeypatch):
+        self._clean_env(monkeypatch)
+        monkeypatch.setenv("AGENT_UPLOAD_ARTIFACTS", "1")
+        monkeypatch.setenv("MINIO_ENDPOINT", "minio.internal:9000")
+        monkeypatch.setenv("MINIO_BUCKET", "artifact-bucket")
+        cfg = load_config()
+        assert cfg.upload_artifacts is True
+        assert cfg.minio_endpoint == "minio.internal:9000"
+        assert cfg.minio_bucket == "artifact-bucket"
 
     def test_config_is_frozen(self, monkeypatch):
         self._clean_env(monkeypatch)

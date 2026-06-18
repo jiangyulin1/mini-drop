@@ -14,6 +14,11 @@ class AgentConfig:
     agent_ip_addr: str
     heartbeat_interval_sec: int = 5
     grpc_auth_token: str = ""
+    upload_artifacts: bool = False
+    minio_endpoint: str = "minio:9000"
+    minio_access_key: str = "mini_drop"
+    minio_secret_key: str = "mini_drop_secret"
+    minio_bucket: str = "mini-drop"
 
 
 def load_config() -> AgentConfig:
@@ -24,6 +29,11 @@ def load_config() -> AgentConfig:
         agent_ip_addr=_resolve_ip(server_grpc_addr),
         heartbeat_interval_sec=int(os.getenv("AGENT_HEARTBEAT_INTERVAL_SEC", "5")),
         grpc_auth_token=os.getenv("MINI_DROP_GRPC_TOKEN", os.getenv("MINI_DROP_API_KEY", "")),
+        upload_artifacts=os.getenv("AGENT_UPLOAD_ARTIFACTS", "0").strip().lower() in {"1", "true", "yes", "on"},
+        minio_endpoint=os.getenv("MINIO_ENDPOINT", "minio:9000"),
+        minio_access_key=os.getenv("MINIO_ACCESS_KEY", "mini_drop"),
+        minio_secret_key=os.getenv("MINIO_SECRET_KEY", "mini_drop_secret"),
+        minio_bucket=os.getenv("MINIO_BUCKET", "mini-drop"),
     )
 
 

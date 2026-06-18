@@ -227,7 +227,14 @@ def get_task_artifact_content(task_id: str, artifact_type: str) -> APIResponse:
         if artifact.get("artifact_type") != artifact_type:
             continue
         local_path = artifact.get("local_path")
-        path = _resolve_artifact_path(local_path)
+        path = _resolve_artifact_path(local_path) if local_path else None
+        if path is None and artifact.get("object_key"):
+            text = _read_artifact_object_text(artifact)
+            if artifact_type.endswith("_json") or artifact.get("content_type") == "application/json":
+                return APIResponse(data=_json_mod.loads(text))
+            return APIResponse(data={"text": text})
+        if path is None:
+            raise HTTPException(status_code=404, detail="本地产物不存在")
         if artifact_type.endswith("_json") or artifact.get("content_type") == "application/json":
             return APIResponse(data=_json_mod.loads(path.read_text(encoding="utf-8")))
         return APIResponse(data={"text": path.read_text(encoding="utf-8", errors="replace")})
@@ -373,8 +380,11 @@ def _extract_artifact_json(artifacts: list[dict], artifact_type: str) -> dict | 
         if art.get("artifact_type") == artifact_type:
             local_path = art.get("local_path", "")
             try:
-                path = _resolve_artifact_path(local_path)
-                return _json_mod.loads(path.read_text(encoding="utf-8"))
+                if local_path:
+                    path = _resolve_artifact_path(local_path)
+                    return _json_mod.loads(path.read_text(encoding="utf-8"))
+                if art.get("object_key"):
+                    return _json_mod.loads(_read_artifact_object_text(art))
             except HTTPException as exc:
                 log_event(
                     "warning",
@@ -415,6 +425,18 @@ def _resolve_artifact_path(local_path: str | None) -> _Path:
     if not resolved.is_file():
         raise HTTPException(status_code=404, detail="本地产物不存在")
     return resolved
+
+
+def _read_artifact_object_text(artifact: dict) -> str:
+    bucket = artifact.get("bucket") or os.getenv("MINIO_BUCKET", "mini-drop")
+    key = _validate_presign_request(bucket, artifact.get("object_key", ""))
+    try:
+        return store.read_object_bytes(bucket, key).decode("utf-8", errors="replace")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        log_event("warning", "artifact_object_read_failed", bucket=bucket, object_key=key, error=type(exc).__name__)
+        raise HTTPException(status_code=404, detail="对象存储产物不存在") from exc
 
 
 def _validate_presign_request(bucket: str, key: str) -> str:

@@ -5,6 +5,7 @@ from typing import Any
 
 from google.protobuf.empty_pb2 import Empty
 
+from server.app.analyzer_runner import analyze_raw_perf_artifacts
 from server.app.generated import hotmethod_pb2_grpc
 from server.app.state_machine import Actor, TaskStatus
 
@@ -56,6 +57,11 @@ class HotmethodService(hotmethod_pb2_grpc.HotmethodServicer):
             task_id, TaskStatus.ANALYZING,
             "产物已记录，等待分析", Actor.SERVER,
         )
+        if not _has_analysis_result(artifacts):
+            generated_artifacts = analyze_raw_perf_artifacts(task_id, artifacts)
+            if generated_artifacts:
+                self._repo.add_artifacts(task_id, generated_artifacts)
+                artifacts.extend(generated_artifacts)
         if _has_analysis_result(artifacts):
             self._repo.transition_task(
                 task_id, TaskStatus.DONE,

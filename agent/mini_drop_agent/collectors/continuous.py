@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import os
+import json
 import shutil
 import signal
 import subprocess
@@ -142,6 +143,9 @@ class ContinuousCollector:
             })
 
         ok_count = sum(1 for w in windows if w.ok)
+        summary_path = os.path.join(task_base, "windows.json")
+        with open(summary_path, "w", encoding="utf-8") as fh:
+            json.dump({"windows": summary_windows}, fh, indent=2)
 
         return CollectorResult(
             ok=ok_count > 0,
@@ -149,9 +153,9 @@ class ContinuousCollector:
             artifacts=all_artifacts + [{
                 "artifact_type": "continuous_summary",
                 "filename": "windows.json",
-                "local_path": os.path.join(task_base, "windows.json"),
+                "local_path": summary_path,
                 "content_type": "application/json",
-                "size_bytes": 0,
+                "size_bytes": os.path.getsize(summary_path),
                 "metadata": {"windows": summary_windows},
             }],
         )

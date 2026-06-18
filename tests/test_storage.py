@@ -48,6 +48,17 @@ class TestUploadFile:
                 store.upload_file("/nonexistent/path.dat", "b", "key")
 
 
+class TestReadObjectBytes:
+    def test_reads_and_closes_object(self):
+        response = mock.MagicMock()
+        response.read.return_value = b"hello"
+        with mock.patch.object(store, "_client") as mock_client:
+            mock_client.return_value.get_object.return_value = response
+            assert store.read_object_bytes("b", "k") == b"hello"
+        response.close.assert_called_once()
+        response.release_conn.assert_called_once()
+
+
 class TestPresignedUrl:
     def test_returns_url_string(self):
         with mock.patch.object(store, "_client") as mock_client:

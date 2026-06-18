@@ -71,6 +71,8 @@ export MINI_DROP_GRPC_AUTH_ENABLED=1
 export MINI_DROP_GRPC_TOKEN="$MINI_DROP_API_KEY"
 ```
 
+Docker Compose 演示中 Agent 可开启 `AGENT_UPLOAD_ARTIFACTS=1`，把采集产物上传到 MinIO 的 `tasks/{task_id}/` 前缀；本地开发默认保留 `local_path` 模式。
+
 Agent 侧配置相同的 `MINI_DROP_GRPC_TOKEN` 后会自动随 gRPC metadata 上报。
 
 ## AI Provider

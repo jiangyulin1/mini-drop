@@ -10,6 +10,7 @@ import time
 import socket
 from collections import namedtuple
 from datetime import timedelta
+from unittest import mock
 
 import grpc
 import pytest
@@ -94,7 +95,7 @@ class TestGrpcAuth:
         fix = GrpcFixture()
         try:
             resp = fix.init_stub.FetchConfig(init_pb2.FetchConfigRequest(agent_id="agent_auth_open"))
-            assert resp.cos_config.endpoint == ""
+            assert resp.cos_config.endpoint == "minio:9000"
         finally:
             fix.close()
 
@@ -115,7 +116,7 @@ class TestGrpcAuth:
         fix = GrpcFixture(metadata=(("x-mini-drop-grpc-token", "secret"),))
         try:
             resp = fix.init_stub.FetchConfig(init_pb2.FetchConfigRequest(agent_id="agent_auth_ok"))
-            assert resp.cos_config.endpoint == ""
+            assert resp.cos_config.endpoint == "minio:9000"
         finally:
             fix.close()
 
@@ -163,12 +164,14 @@ class TestInitAgent:
         ]
         assert len(online_events) == 1
 
-    def test_fetch_config_returns_empty(self, grpc_fix: GrpcFixture):
+    def test_fetch_config_returns_minio_settings(self, grpc_fix: GrpcFixture, monkeypatch):
+        monkeypatch.setenv("MINIO_ENDPOINT", "minio.test:9000")
+        monkeypatch.setenv("MINIO_BUCKET", "mini-drop-test")
         resp = grpc_fix.init_stub.FetchConfig(
             init_pb2.FetchConfigRequest(agent_id=self.AGENT_ID)
         )
-        # 当前阶段返回空 CosConfig
-        assert resp.cos_config.endpoint == ""
+        assert resp.cos_config.endpoint == "minio.test:9000"
+        assert resp.cos_config.bucket == "mini-drop-test"
 
 
 class TestHealthCheck:
@@ -272,6 +275,35 @@ class TestHotmethodNotifyResult:
         task = grpc_fix.repo.tasks[task_id]
         assert task.status == TaskStatus.ANALYZING
         assert len(grpc_fix.repo.artifacts.get(task_id, [])) == 1
+
+    def test_notify_raw_perf_runs_server_analyzer_fallback(self, grpc_fix: GrpcFixture, tmp_path, monkeypatch):
+        monkeypatch.setenv("MINI_DROP_ARTIFACT_ROOT", str(tmp_path))
+        task_id = self._create_and_start_task(grpc_fix)
+        perf_path = tmp_path / task_id / "perf.data"
+        perf_path.parent.mkdir()
+        perf_path.write_text("perf", encoding="utf-8")
+        generated = [{"artifact_type": "top_json", "filename": "top.json", "local_path": str(tmp_path / task_id / "top.json")}]
+
+        with mock.patch(
+            "server.app.grpc_services.hotmethod_service.analyze_raw_perf_artifacts",
+            return_value=generated,
+        ):
+            grpc_fix.hotmethod_stub.NotifyResult(
+                hotmethod_pb2.TaskResult(
+                    task_id=task_id,
+                    error_message="",
+                    artifact_metadata_json=json.dumps([{
+                        "artifact_type": "raw",
+                        "filename": "perf.data",
+                        "local_path": str(perf_path),
+                    }]),
+                )
+            )
+
+        task = grpc_fix.repo.tasks[task_id]
+        artifact_types = {item["artifact_type"] for item in grpc_fix.repo.artifacts.get(task_id, [])}
+        assert task.status == TaskStatus.DONE
+        assert {"raw", "top_json"} <= artifact_types
 
     def test_notify_sanitizes_artifact_metadata(self, grpc_fix: GrpcFixture):
         task_id = self._create_and_start_task(grpc_fix)

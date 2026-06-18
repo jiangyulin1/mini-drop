@@ -309,6 +309,25 @@ class TestTaskArtifacts:
         content = client.get(f"/api/tasks/{task_id}/artifacts/top_json/content")
         assert content.status_code == 403
 
+    def test_artifact_content_reads_minio_object(self, client: TestClient, monkeypatch):
+        resp = client.post("/api/tasks", json={
+            "name": "art-object", "agent_id": "a1",
+            "target_pid": 1, "collector_type": "perf_cpu",
+        })
+        task_id = resp.json()["data"]["task_id"]
+        repo.add_artifacts(task_id, [{
+            "artifact_type": "top_json",
+            "bucket": "mini-drop",
+            "object_key": f"tasks/{task_id}/top.json",
+            "content_type": "application/json",
+        }])
+        monkeypatch.setattr(store, "read_object_bytes", lambda bucket, key: b'[{"name":"fib","samples":1}]')
+
+        content = client.get(f"/api/tasks/{task_id}/artifacts/top_json/content")
+
+        assert content.status_code == 200
+        assert content.json()["data"][0]["name"] == "fib"
+
 
 class TestStoragePresign:
     """对象存储预签名 URL 端点。"""

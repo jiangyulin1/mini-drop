@@ -1,5 +1,6 @@
 """InitAgent gRPC 服务：Agent 注册与配置拉取。"""
 
+import os
 from typing import Any
 
 from server.app.generated import init_pb2, init_pb2_grpc
@@ -26,4 +27,12 @@ class InitAgentService(init_pb2_grpc.InitAgentServicer):
     def FetchConfig(self, request: init_pb2.FetchConfigRequest, context) -> init_pb2.FetchConfigResponse:
         # 当前阶段 MinIO 凭证通过环境变量注入，暂不从 gRPC 下发。
         # 返回空 CosConfig 表示 Agent 应使用环境变量中的凭证。
-        return init_pb2.FetchConfigResponse()
+        return init_pb2.FetchConfigResponse(
+            cos_config=init_pb2.common__pb2.CosConfig(
+                endpoint=os.getenv("MINIO_ENDPOINT", "minio:9000"),
+                access_key=os.getenv("MINIO_ACCESS_KEY", "mini_drop"),
+                secret_key=os.getenv("MINIO_SECRET_KEY", "mini_drop_secret"),
+                bucket=os.getenv("MINIO_BUCKET", "mini-drop"),
+                region=os.getenv("MINIO_REGION", ""),
+            )
+        )
