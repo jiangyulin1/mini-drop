@@ -253,7 +253,7 @@ def get_task_artifact_content(task_id: str, artifact_type: str) -> APIResponse:
         if artifact.get("artifact_type") != artifact_type:
             continue
         local_path = artifact.get("local_path")
-        path = _resolve_artifact_path(local_path) if local_path else None
+        path = _resolve_artifact_path_or_none(local_path)
         if path is None and artifact.get("object_key"):
             text = _read_artifact_object_text(artifact)
             if artifact_type.endswith("_json") or artifact.get("content_type") == "application/json":
@@ -406,8 +406,8 @@ def _extract_artifact_json(artifacts: list[dict], artifact_type: str) -> dict | 
         if art.get("artifact_type") == artifact_type:
             local_path = art.get("local_path", "")
             try:
-                if local_path:
-                    path = _resolve_artifact_path(local_path)
+                path = _resolve_artifact_path_or_none(local_path)
+                if path is not None:
                     return _json_mod.loads(path.read_text(encoding="utf-8"))
                 if art.get("object_key"):
                     return _json_mod.loads(_read_artifact_object_text(art))
@@ -451,6 +451,15 @@ def _resolve_artifact_path(local_path: str | None) -> _Path:
     if not resolved.is_file():
         raise HTTPException(status_code=404, detail="本地产物不存在")
     return resolved
+
+
+def _resolve_artifact_path_or_none(local_path: str | None) -> _Path | None:
+    try:
+        return _resolve_artifact_path(local_path)
+    except HTTPException as exc:
+        if exc.status_code == 404:
+            return None
+        raise
 
 
 def _read_artifact_object_text(artifact: dict) -> str:

@@ -355,6 +355,32 @@ class TestTaskArtifacts:
         assert content.status_code == 200
         assert content.json()["data"][0]["name"] == "fib"
 
+    def test_artifact_content_falls_back_to_minio_when_local_path_missing(
+        self,
+        client: TestClient,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.setenv("MINI_DROP_ARTIFACT_ROOT", str(tmp_path))
+        resp = client.post("/api/tasks", json={
+            "name": "art-object-fallback", "agent_id": "a1",
+            "target_pid": 1, "collector_type": "pyspy",
+        })
+        task_id = resp.json()["data"]["task_id"]
+        repo.add_artifacts(task_id, [{
+            "artifact_type": "flamegraph_svg",
+            "bucket": "mini-drop",
+            "object_key": f"tasks/{task_id}/pyspy.svg",
+            "local_path": str(tmp_path / task_id / "pyspy.svg"),
+            "content_type": "image/svg+xml",
+        }])
+        monkeypatch.setattr(store, "read_object_bytes", lambda bucket, key: b"<svg></svg>")
+
+        content = client.get(f"/api/tasks/{task_id}/artifacts/flamegraph_svg/content")
+
+        assert content.status_code == 200
+        assert content.json()["data"]["text"] == "<svg></svg>"
+
 
 class TestStoragePresign:
     """对象存储预签名 URL 端点。"""
