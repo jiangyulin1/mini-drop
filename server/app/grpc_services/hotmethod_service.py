@@ -10,6 +10,7 @@ from server.app.state_machine import Actor, TaskStatus
 
 MAX_ARTIFACTS_PER_TASK = 32
 MAX_ARTIFACT_FIELD_LENGTH = 512
+MAX_ERROR_MESSAGE_LENGTH = 1024
 
 
 class HotmethodService(hotmethod_pb2_grpc.HotmethodServicer):
@@ -22,10 +23,11 @@ class HotmethodService(hotmethod_pb2_grpc.HotmethodServicer):
         task_id = request.task_id
 
         if request.error_message:
+            reason = _safe_text(request.error_message, max_length=MAX_ERROR_MESSAGE_LENGTH) or "Agent reported collection failure"
             # Agent 报告采集失败
             self._repo.transition_task(
                 task_id, TaskStatus.FAILED,
-                request.error_message, Actor.AGENT,
+                reason, Actor.AGENT,
             )
             return Empty()
 

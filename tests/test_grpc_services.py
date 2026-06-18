@@ -315,6 +315,18 @@ class TestHotmethodNotifyResult:
         assert task.status == TaskStatus.FAILED
         assert task.status_reason == "目标 PID 不存在"
 
+    def test_notify_failure_sanitizes_error_message(self, grpc_fix: GrpcFixture):
+        task_id = self._create_and_start_task(grpc_fix)
+        grpc_fix.hotmethod_stub.NotifyResult(
+            hotmethod_pb2.TaskResult(
+                task_id=task_id,
+                error_message="\x00" + ("x" * 2000),
+            )
+        )
+        task = grpc_fix.repo.tasks[task_id]
+        assert "\x00" not in task.status_reason
+        assert len(task.status_reason) == 1024
+
 
 class TestControlService:
     """Control 服务：Web → Server 任务创建与查询。"""
