@@ -8,6 +8,9 @@ from google.protobuf.empty_pb2 import Empty
 from server.app.generated import hotmethod_pb2_grpc
 from server.app.state_machine import Actor, TaskStatus
 
+MAX_ARTIFACTS_PER_TASK = 32
+MAX_ARTIFACT_FIELD_LENGTH = 512
+
 
 class HotmethodService(hotmethod_pb2_grpc.HotmethodServicer):
     """采集结果上报服务。"""
@@ -41,6 +44,7 @@ class HotmethodService(hotmethod_pb2_grpc.HotmethodServicer):
                 artifacts = [{"artifact_type": request.artifact_type, "cos_key": request.cos_key}]
         elif request.cos_key:
             artifacts = [{"artifact_type": request.artifact_type or "raw", "cos_key": request.cos_key}]
+        artifacts = _sanitize_artifacts(artifacts)
 
         if artifacts:
             self._repo.add_artifacts(task_id, artifacts)
@@ -68,3 +72,53 @@ def _has_analysis_result(artifacts: list[dict]) -> bool:
         "ebpf_metrics",
         "continuous_summary",
     } & artifact_types)
+
+
+def _sanitize_artifacts(raw_artifacts) -> list[dict]:
+    if not isinstance(raw_artifacts, list):
+        return []
+
+    sanitized: list[dict] = []
+    for item in raw_artifacts[:MAX_ARTIFACTS_PER_TASK]:
+        if not isinstance(item, dict):
+            continue
+
+        artifact_type = _safe_text(item.get("artifact_type") or "raw", max_length=64)
+        if not artifact_type:
+            artifact_type = "raw"
+        artifact: dict = {"artifact_type": artifact_type}
+
+        for key in ("bucket", "object_key", "cos_key", "filename", "local_path", "content_type"):
+            value = _safe_text(item.get(key))
+            if value:
+                artifact[key] = value
+
+        try:
+            size_bytes = int(item.get("size_bytes", 0) or 0)
+        except (TypeError, ValueError):
+            size_bytes = 0
+        artifact["size_bytes"] = max(0, size_bytes)
+
+        metadata = item.get("metadata")
+        if isinstance(metadata, dict):
+            artifact["metadata"] = _sanitize_metadata(metadata)
+
+        sanitized.append(artifact)
+    return sanitized
+
+
+def _sanitize_metadata(metadata: dict) -> dict:
+    result: dict = {}
+    for key, value in list(metadata.items())[:32]:
+        safe_key = _safe_text(key, max_length=64)
+        if not safe_key:
+            continue
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            result[safe_key] = value if not isinstance(value, str) else _safe_text(value)
+    return result
+
+
+def _safe_text(value, max_length: int = MAX_ARTIFACT_FIELD_LENGTH) -> str:
+    if value is None:
+        return ""
+    return str(value).replace("\x00", "")[:max_length].strip()

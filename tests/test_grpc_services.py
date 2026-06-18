@@ -4,6 +4,7 @@
 验证服务实现与 Repository 交互的正确性。
 """
 
+import json
 import threading
 import time
 import socket
@@ -200,6 +201,32 @@ class TestHotmethodNotifyResult:
         task = grpc_fix.repo.tasks[task_id]
         assert task.status == TaskStatus.ANALYZING
         assert len(grpc_fix.repo.artifacts.get(task_id, [])) == 1
+
+    def test_notify_sanitizes_artifact_metadata(self, grpc_fix: GrpcFixture):
+        task_id = self._create_and_start_task(grpc_fix)
+        artifacts = [
+            {
+                "artifact_type": "raw",
+                "filename": f"artifact_{idx}.txt",
+                "unexpected": "drop-me",
+                "size_bytes": "-1",
+                "metadata": {"window_index": idx, "nested": {"drop": True}},
+            }
+            for idx in range(40)
+        ]
+        grpc_fix.hotmethod_stub.NotifyResult(
+            hotmethod_pb2.TaskResult(
+                task_id=task_id,
+                error_message="",
+                artifact_metadata_json=json.dumps(artifacts),
+            )
+        )
+
+        stored = grpc_fix.repo.artifacts.get(task_id, [])
+        assert len(stored) == 32
+        assert "unexpected" not in stored[0]
+        assert stored[0]["size_bytes"] == 0
+        assert stored[0]["metadata"] == {"window_index": 0}
 
     def test_notify_analysis_artifacts_transitions_to_done(self, grpc_fix: GrpcFixture):
         task_id = self._create_and_start_task(grpc_fix)
