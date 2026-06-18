@@ -14,6 +14,17 @@ Example for a VM whose address is `172.24.188.165`:
 MINIO_PUBLIC_ENDPOINT=172.24.188.165:9000
 ```
 
+## Host profiling prerequisites
+
+The Agent container runs with `privileged` and `pid: host`, but Linux still needs to allow `perf` sampling on the host. For demo VMs, set:
+
+```bash
+echo 'kernel.perf_event_paranoid=1' | sudo tee /etc/sysctl.d/99-mini-drop.conf
+sudo sysctl -p /etc/sysctl.d/99-mini-drop.conf
+```
+
+MinIO also refuses uploads when the host disk is almost full. Keep at least 1 GB free for short smoke tests, and more for longer profiling sessions.
+
 ## Local/offline demo mode
 
 When Docker cannot pull `node:20-alpine`, `postgres:16`, or MinIO images, use the local override:
