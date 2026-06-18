@@ -8,6 +8,12 @@
 
 For remote deployments, set `MINIO_PUBLIC_ENDPOINT` to a domain or IP that the user's browser can reach.
 
+Example for a VM whose address is `172.24.188.165`:
+
+```bash
+MINIO_PUBLIC_ENDPOINT=172.24.188.165:9000
+```
+
 ## Local/offline demo mode
 
 When Docker cannot pull `node:20-alpine`, `postgres:16`, or MinIO images, use the local override:
