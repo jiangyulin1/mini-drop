@@ -121,3 +121,43 @@ Agent 采集期间自身开销：
 - IO 读 < 50 KB/s
 
 数据来源：Agent 心跳中上报的 PidStats（读取 /proc/self/stat + /proc/self/io）。
+
+## 9. 安全加固补充
+
+### 9.1 HTTP API Key 认证
+
+默认开发模式保持无认证，便于本地 demo 和自动化测试。生产或公网演示时可通过环境变量开启最小认证：
+
+```bash
+MINI_DROP_API_AUTH_ENABLED=1
+MINI_DROP_API_KEY=<strong-random-token>
+```
+
+开启后，除 `/api/healthz` 外的 `/api/*` 接口必须携带以下任一凭据：
+
+- `Authorization: Bearer <token>`
+- `X-API-Key: <token>`
+
+认证使用常量时间比较，避免普通字符串比较带来的时序侧信道。该方案属于单租户最小安全边界，不替代完整用户、组、权限模型。
+
+### 9.2 产物访问边界
+
+Agent 上报的 `local_path` 不再被 Server 无条件读取。HTTP 产物内容接口会先把路径解析到受控根目录：
+
+```bash
+MINI_DROP_ARTIFACT_ROOT=/tmp/mini-drop
+```
+
+规则：
+
+- 相对路径会被解释为 `MINI_DROP_ARTIFACT_ROOT` 下的路径。
+- 绝对路径必须仍位于 `MINI_DROP_ARTIFACT_ROOT` 内。
+- `resolve()` 后逃逸根目录的路径会被拒绝，包含符号链接逃逸场景。
+- 预签名 URL 只允许配置 bucket，且 object key 必须位于 `tasks/` 目录下。
+
+### 9.3 剩余安全工作
+
+- gRPC 仍为 insecure channel，后续应增加可选 TLS / mTLS。
+- API Key 是全局共享密钥，后续应升级为用户级 token 或接入真实鉴权系统。
+- 产物元数据仍由 Agent 上报，后续应增加 artifact schema 校验和上传侧签名校验。
+- 多租户、任务权限、审计查询权限尚未实现，当前版本定位为单租户 Mini-Drop MVP。
