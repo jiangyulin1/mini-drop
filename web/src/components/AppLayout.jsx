@@ -1,10 +1,12 @@
-import { Layout, Typography } from "antd";
+import { Button, Input, Layout, Space, Typography, message } from "antd";
 import { Outlet, useNavigate, useLocation } from "react-router-dom";
 import {
   DashboardOutlined,
   AuditOutlined,
+  KeyOutlined,
 } from "@ant-design/icons";
 import { useState } from "react";
+import { getStoredApiKey, setStoredApiKey } from "../api/client";
 
 const { Header, Sider, Content } = Layout;
 
@@ -17,6 +19,7 @@ export default function AppLayout() {
   const navigate = useNavigate();
   const location = useLocation();
   const [collapsed] = useState(false);
+  const [apiKey, setApiKey] = useState(() => getStoredApiKey());
 
   const selectedKey = location.pathname.startsWith("/task/")
     ? "/"
@@ -74,11 +77,31 @@ export default function AppLayout() {
             borderBottom: "1px solid #f0f0f0",
             display: "flex",
             alignItems: "center",
+            justifyContent: "space-between",
+            gap: 16,
           }}
         >
           <Typography.Text strong style={{ fontSize: 16 }}>
             Mini-Drop 性能诊断平台
           </Typography.Text>
+          <Space.Compact>
+            <Input.Password
+              aria-label="API Key"
+              placeholder="API Key"
+              value={apiKey}
+              onChange={(event) => setApiKey(event.target.value)}
+              style={{ width: 220 }}
+            />
+            <Button
+              icon={<KeyOutlined />}
+              onClick={() => {
+                setStoredApiKey(apiKey);
+                message.success(apiKey.trim() ? "API Key 已保存" : "API Key 已清除");
+              }}
+            >
+              保存
+            </Button>
+          </Space.Compact>
         </Header>
         <Content style={{ margin: 16, padding: 24, background: "#fff", borderRadius: 8 }}>
           <Outlet />

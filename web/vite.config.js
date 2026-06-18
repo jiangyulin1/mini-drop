@@ -6,6 +6,7 @@ export default defineConfig({
   root: ".",
   build: {
     outDir: "dist",
+    chunkSizeWarningLimit: 900,
     rollupOptions: {
       output: {
         entryFileNames: "assets/[name]-[hash].js",
@@ -15,6 +16,7 @@ export default defineConfig({
           if (!id.includes("node_modules")) return undefined;
           if (id.includes("react")) return "react";
           if (id.includes("echarts") || id.includes("d3") || id.includes("d3-flame-graph")) return "charts";
+          if (id.includes("axios")) return "axios";
           return undefined;
         },
       },

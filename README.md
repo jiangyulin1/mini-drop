@@ -61,6 +61,8 @@ Server 只允许读取受控目录下的本地产物，默认根目录为 `/tmp/
 export MINI_DROP_ARTIFACT_ROOT=/tmp/mini-drop
 ```
 
+Web 顶栏 API Key 输入框会保存 token 到浏览器 localStorage，并自动附加到后续 REST 请求。
+
 对象存储预签名 URL 只允许签发配置 bucket 下 `tasks/` 前缀的任务产物。
 
 Agent gRPC 控制面默认关闭认证，生产或公网演示建议开启：

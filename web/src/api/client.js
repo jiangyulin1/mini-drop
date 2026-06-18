@@ -6,9 +6,19 @@ axios 拦截器统一处理错误码和响应格式。
 
 import axios from "axios";
 
+const API_KEY_STORAGE_KEY = "mini-drop-api-key";
+
 const api = axios.create({
   baseURL: "/api",
   timeout: 30000,
+});
+
+api.interceptors.request.use((config) => {
+  const token = getStoredApiKey();
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`;
+  }
+  return config;
 });
 
 /** 响应拦截：统一提取 data 字段，简化调用方代码 */
@@ -25,6 +35,27 @@ api.interceptors.response.use(
 );
 
 // ── 通用 ────────────────────────────────────────────────────────
+
+export function getStoredApiKey() {
+  try {
+    return window.localStorage.getItem(API_KEY_STORAGE_KEY) || "";
+  } catch {
+    return "";
+  }
+}
+
+export function setStoredApiKey(token) {
+  try {
+    const normalized = (token || "").trim();
+    if (normalized) {
+      window.localStorage.setItem(API_KEY_STORAGE_KEY, normalized);
+    } else {
+      window.localStorage.removeItem(API_KEY_STORAGE_KEY);
+    }
+  } catch {
+    // Ignore unavailable localStorage in restricted browser contexts.
+  }
+}
 
 export function healthz() {
   return api.get("/healthz");
