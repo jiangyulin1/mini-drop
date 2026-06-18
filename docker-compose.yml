@@ -59,6 +59,12 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8191/api/healthz >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
 
   agent:
     build:
@@ -69,7 +75,8 @@ services:
       AGENT_ID: agent_docker_demo
       AGENT_HEARTBEAT_INTERVAL_SEC: "5"
     depends_on:
-      - server
+      server:
+        condition: service_healthy
     privileged: true
     pid: host
     cap_add:
@@ -84,7 +91,14 @@ services:
     ports:
       - "80:80"
     depends_on:
-      - server
+      server:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 5s
 
 volumes:
   pgdata:
