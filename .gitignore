@@ -51,3 +51,12 @@ perf.data.*
 # Secrets
 *.pem
 *.key
+
+# NapCat QQ 机器人运行时文件（通过 setup.ps1 安装）
+deploy/napcat/*.exe
+deploy/napcat/*.dll
+deploy/napcat/*.zip
+deploy/napcat/bootmain/
+deploy/napcat/*.cmd
+!deploy/napcat/README.md
+!deploy/napcat/setup.ps1
