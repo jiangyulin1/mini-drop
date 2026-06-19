@@ -1,22 +1,6 @@
-<#
-.SYNOPSIS
-  Mini-Drop NapCat QQ 机器人一键安装脚本
-
-.DESCRIPTION
-  自动下载、配置 NapCat（OneBot v11 兼容的 QQ 机器人框架），
-  与 Mini-Drop 的 ChatOps qqbot 模块无缝对接。
-
-  执行后只需：
-    1. 运行 deploy\napcat\start-qq.cmd 扫码登录 QQ
-    2. 在 Mini-Drop .env 中填入 QQ 机器人配置
-    3. 启动 micro-drop serve
-
-.PARAMETER InstallDir
-  NapCat 安装目录，默认为当前目录
-
-.EXAMPLE
-  powershell -ExecutionPolicy Bypass -File setup.ps1
-#>
+﻿# Mini-Drop NapCat QQ Bot Setup
+# Usage: powershell -ExecutionPolicy Bypass -File setup.ps1
+# Encoding: UTF-8 with BOM
 
 param(
     [string]$InstallDir = "$PSScriptRoot"
@@ -24,75 +8,73 @@ param(
 
 $ErrorActionPreference = "Stop"
 $NAP_VER = "v4.18.6"
-$NAP_DOWNLOAD = "https://github.com/NapNeko/NapCatQQ/releases/download/$NAP_VER/NapCat.Shell.Windows.OneKey.zip"
-$ZIP_FILE = "$InstallDir\NapCat.OneKey.zip"
+$NAP_URL = "https://github.com/NapNeko/NapCatQQ/releases/download/$NAP_VER/NapCat.Shell.Windows.OneKey.zip"
+$ZIP_FILE = Join-Path $InstallDir "NapCat.OneKey.zip"
 
 Write-Host ""
 Write-Host "============================================" -ForegroundColor Cyan
-Write-Host "  Mini-Drop × NapCat QQ 机器人安装向导" -ForegroundColor Cyan
+Write-Host "  Mini-Drop x NapCat QQ Bot Setup" -ForegroundColor Cyan
 Write-Host "============================================" -ForegroundColor Cyan
 Write-Host ""
 
-# 1. 下载
-Write-Host "[1/3] 下载 NapCat $NAP_VER …" -ForegroundColor Yellow
+# Step 1: Download
+Write-Host "[1/3] Downloading NapCat $NAP_VER ..." -ForegroundColor Yellow
 if (Test-Path $ZIP_FILE) {
-    Write-Host "  安装包已存在，跳过下载" -ForegroundColor Green
+    Write-Host "  Already downloaded, skipping" -ForegroundColor Green
 } else {
     try {
-        Invoke-WebRequest -Uri $NAP_DOWNLOAD -OutFile $ZIP_FILE -TimeoutSec 120
-        Write-Host "  下载完成: $ZIP_FILE" -ForegroundColor Green
+        [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+        Invoke-WebRequest -Uri $NAP_URL -OutFile $ZIP_FILE -TimeoutSec 180
+        Write-Host "  Done: $ZIP_FILE" -ForegroundColor Green
     } catch {
-        Write-Host "  下载失败! 请手动下载并解压到 $InstallDir" -ForegroundColor Red
-        Write-Host "  $NAP_DOWNLOAD" -ForegroundColor Gray
+        Write-Host "  Download failed!" -ForegroundColor Red
+        Write-Host "  Manual download: $NAP_URL" -ForegroundColor Gray
+        Write-Host "  Extract to: $InstallDir" -ForegroundColor Gray
+        Read-Host "Press Enter to exit"
         exit 1
     }
 }
 
-# 2. 解压
-Write-Host "[2/3] 解压安装包 …" -ForegroundColor Yellow
+# Step 2: Extract
+Write-Host "[2/3] Extracting ..." -ForegroundColor Yellow
 try {
     Expand-Archive -Path $ZIP_FILE -DestinationPath $InstallDir -Force
-    Write-Host "  解压完成" -ForegroundColor Green
+    Write-Host "  Done" -ForegroundColor Green
 } catch {
-    Write-Host "  解压失败! 请手动解压 $ZIP_FILE 到 $InstallDir" -ForegroundColor Red
+    Write-Host "  Extract failed! Please unzip $ZIP_FILE manually to $InstallDir" -ForegroundColor Red
+    Read-Host "Press Enter to exit"
     exit 1
 }
 
-# 3. 创建启动脚本
-Write-Host "[3/3] 生成启动脚本和配置模板 …" -ForegroundColor Yellow
+# Step 3: Generate launcher
+Write-Host "[3/3] Generating launcher scripts ..." -ForegroundColor Yellow
 
-# 一键启动 + 登录的 cmd 脚本
 $startCmd = @'
 @echo off
 chcp 65001 >nul
 title NapCat QQ Bot
-
 echo.
 echo ============================================
-echo   NapCat QQ 机器人启动中…
+echo   NapCat QQ Bot - Starting...
 echo ============================================
 echo.
-echo 如果弹出 QQ 登录窗口，请扫码登录。
-echo 登录成功后 NapCat 将在后台运行。
+echo If QQ login window appears, scan QR code to login.
+echo After login, NapCat runs in background.
 echo.
-echo OneBot HTTP API 地址: http://localhost:5700
+echo OneBot HTTP API: http://localhost:5700
 echo.
-echo 按 Ctrl+C 或关闭此窗口停止机器人。
+echo Press Ctrl+C to stop the bot.
 echo ============================================
 echo.
-
 if exist bootmain\napcat.bat (
     cd bootmain
     call napcat.bat
 ) else (
-    echo [错误] 未找到 bootmain\napcat.bat，请确认解压完整
-    echo 预期路径: %cd%\bootmain\napcat.bat
+    echo [ERROR] bootmain\napcat.bat not found
     pause
 )
 '@
-$startCmd | Out-File -FilePath "$InstallDir\start-qq.cmd" -Encoding UTF8
 
-# 快速重新登录脚本（跳过框架更新）
 $quickCmd = @'
 @echo off
 chcp 65001 >nul
@@ -101,34 +83,37 @@ if exist bootmain\napcat.quick.bat (
     cd bootmain
     call napcat.quick.bat
 ) else (
-    echo [错误] 未找到 bootmain\napcat.quick.bat
+    echo [ERROR] bootmain\napcat.quick.bat not found
     pause
 )
 '@
-$quickCmd | Out-File -FilePath "$InstallDir\start-qq-quick.cmd" -Encoding UTF8
 
-Write-Host "  启动脚本已生成: start-qq.cmd" -ForegroundColor Green
-Write-Host "  快速登录脚本:    start-qq-quick.cmd" -ForegroundColor Green
+[System.IO.File]::WriteAllText((Join-Path $InstallDir "start-qq.cmd"), $startCmd, [System.Text.UTF8Encoding]::new($true))
+[System.IO.File]::WriteAllText((Join-Path $InstallDir "start-qq-quick.cmd"), $quickCmd, [System.Text.UTF8Encoding]::new($true))
+
+Write-Host "  start-qq.cmd created" -ForegroundColor Green
+Write-Host "  start-qq-quick.cmd created" -ForegroundColor Green
 
 Write-Host ""
 Write-Host "============================================" -ForegroundColor Cyan
-Write-Host "  安装完成!" -ForegroundColor Green
+Write-Host "  Setup complete!" -ForegroundColor Green
 Write-Host "============================================" -ForegroundColor Cyan
 Write-Host ""
-Write-Host "  接下来请执行以下步骤:" -ForegroundColor White
+Write-Host "Next steps:" -ForegroundColor White
 Write-Host ""
-Write-Host "  1. 运行 start-qq.cmd 并扫码登录 QQ" -ForegroundColor Yellow
-Write-Host "  2. 在 Mini-Drop .env 中添加:" -ForegroundColor Yellow
+Write-Host "  1. Run: deploy\napcat\start-qq.cmd" -ForegroundColor Yellow
+Write-Host "  2. Scan QR code to login QQ" -ForegroundColor Yellow
+Write-Host "  3. Get your QQ group ID (right-click group -> info -> copy number)" -ForegroundColor Yellow
+Write-Host "  4. Add to Mini-Drop .env:" -ForegroundColor Yellow
 Write-Host ""
 Write-Host "     MINI_DROP_CHATOPS_ENABLED=1" -ForegroundColor Gray
 Write-Host "     MINI_DROP_CHATOPS_PROVIDER=qqbot" -ForegroundColor Gray
 Write-Host "     MINI_DROP_CHATOPS_WEBHOOK_URL=http://localhost:5700" -ForegroundColor Gray
 Write-Host "     MINI_DROP_QQBOT_TARGET_TYPE=group" -ForegroundColor Gray
-Write-Host "     MINI_DROP_QQBOT_TARGET_ID=你的群号" -ForegroundColor Gray
+Write-Host "     MINI_DROP_QQBOT_TARGET_ID=YOUR_GROUP_ID" -ForegroundColor Gray
 Write-Host ""
-Write-Host "  3. 启动 Mini-Drop: micro-drop serve" -ForegroundColor Yellow
-Write-Host "  4. 测试连接: micro-drop chatops-test" -ForegroundColor Yellow
+Write-Host "  5. Start Mini-Drop and test: micro-drop chatops-test" -ForegroundColor Yellow
 Write-Host ""
-Write-Host "  详细文档: deploy/napcat/README.md" -ForegroundColor Gray
+Write-Host "  Full guide: deploy/napcat/README.md" -ForegroundColor Gray
 Write-Host ""
-pause
+Read-Host "Press Enter to exit"
