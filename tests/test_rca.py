@@ -430,7 +430,7 @@ class TestSelfRepair:
         }
 
         with mock.patch.dict("os.environ", {"DEEPSEEK_API_KEY": "test-key"}):
-            with mock.patch("server.app.rca.llm_client._post_json", side_effect=[mock_resp_bad, mock_resp_good]):
+            with mock.patch("server.app.rca.llm_client.chat_completions", side_effect=[mock_resp_bad, mock_resp_good]):
                 from server.app.rca.llm_client import diagnose
                 result = diagnose(
                     task_id="t1",
@@ -451,7 +451,7 @@ class TestSelfRepair:
         }
 
         with mock.patch.dict("os.environ", {"DEEPSEEK_API_KEY": "test-key"}):
-            with mock.patch("server.app.rca.llm_client._post_json", return_value=mock_resp):
+            with mock.patch("server.app.rca.llm_client.chat_completions", return_value=mock_resp):
                 from server.app.rca.llm_client import diagnose
                 result = diagnose(
                     task_id="t1",
