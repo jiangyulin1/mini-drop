@@ -11,6 +11,8 @@ import os
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from server.app.common_utils import env_bool
+
 FeatureName = Literal["nlp", "rca", "summarize"]
 
 
@@ -40,9 +42,9 @@ def get_ai_settings() -> AISettings:
         base_url=base_url.rstrip("/"),
         api_key=api_key,
         model=model,
-        nlp_enabled=_env_bool("MINI_DROP_NLP_ENABLED", defaults["nlp"]),
-        rca_enabled=_env_bool("MINI_DROP_RCA_ENABLED", defaults["rca"]),
-        summarize_enabled=_env_bool("MINI_DROP_SUMMARIZE_ENABLED", defaults["summarize"]),
+        nlp_enabled=env_bool("MINI_DROP_NLP_ENABLED", defaults["nlp"]),
+        rca_enabled=env_bool("MINI_DROP_RCA_ENABLED", defaults["rca"]),
+        summarize_enabled=env_bool("MINI_DROP_SUMMARIZE_ENABLED", defaults["summarize"]),
     )
 
 
@@ -86,13 +88,6 @@ def _mode_defaults(mode: str) -> dict[str, bool]:
     if mode == "rca-only":
         return {"nlp": False, "rca": True, "summarize": False}
     return {"nlp": True, "rca": True, "summarize": True}
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on", "full", "enabled"}
 
 
 def _post_json(url: str, headers: dict, json: dict, timeout: int):

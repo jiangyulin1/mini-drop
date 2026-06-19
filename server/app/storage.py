@@ -6,6 +6,8 @@ import os
 from datetime import timedelta
 from typing import Any
 
+from server.app.common_utils import env_bool
+
 MAX_PRESIGN_EXPIRES_SEC = 7 * 24 * 60 * 60
 
 
@@ -33,7 +35,7 @@ def _presign_client() -> Any:
         return _client()
 
     endpoint, inferred_secure = _normalize_endpoint(public_endpoint)
-    secure = _env_bool("MINIO_PUBLIC_SECURE", inferred_secure)
+    secure = env_bool("MINIO_PUBLIC_SECURE", inferred_secure)
     return _client(endpoint=endpoint, secure=secure)
 
 
@@ -44,13 +46,6 @@ def _normalize_endpoint(endpoint: str) -> tuple[str, bool]:
     if endpoint.startswith("http://"):
         return endpoint.removeprefix("http://"), False
     return endpoint, False
-
-
-def _env_bool(name: str, default: bool = False) -> bool:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def ensure_bucket(bucket: str) -> None:

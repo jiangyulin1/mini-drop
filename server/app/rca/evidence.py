@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 
+from server.app.common_utils import status_value
 from server.app.rca.models import EvidenceInput
 
 
@@ -36,8 +37,7 @@ def collect_evidence(
     Returns:
         EvidenceInput 实例。
     """
-    status = task_record.status if task_record else "UNKNOWN"
-    status_value = status.value if hasattr(status, "value") else str(status)
+    task_status = task_record.status if task_record else "UNKNOWN"
 
     return EvidenceInput(
         task_metadata={
@@ -47,7 +47,7 @@ def collect_evidence(
             "target_pid": getattr(task_record, "target_pid", None) if task_record else None,
             "duration_sec": getattr(task_record, "duration_sec", 0) if task_record else 0,
             "sample_rate": getattr(task_record, "sample_rate", 0) if task_record else 0,
-            "status": status_value,
+            "status": status_value(task_status),
             "status_reason": getattr(task_record, "status_reason", "") if task_record else "",
         },
         top_functions=top_functions or [],

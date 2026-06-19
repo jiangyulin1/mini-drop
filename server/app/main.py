@@ -18,6 +18,7 @@ from pathlib import Path as _Path
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
+from server.app.common_utils import status_value
 from server.app.database import init_db
 from server.app.grpc_server import serve_in_background
 from server.app.logging_utils import log_event
@@ -37,10 +38,6 @@ from server.app.sql_repository import SqlRepository
 from server.app import storage as store
 
 repo = SqlRepository()
-
-
-def _status_value(status) -> str:
-    return status.value if hasattr(status, "value") else str(status)
 
 
 @asynccontextmanager
@@ -135,7 +132,7 @@ def _task_view(record) -> TaskView:
         collector_type=record.collector_type,
         sample_rate=record.sample_rate,
         duration_sec=record.duration_sec,
-        status=_status_value(record.status),
+        status=status_value(record.status),
         status_reason=record.status_reason,
         request_params=record.request_params,
         created_at=record.created_at,
@@ -213,7 +210,7 @@ def create_task(payload: CreateTaskRequest) -> APIResponse:
         task = repo.create_task(payload)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return APIResponse(data={"task_id": task.id, "status": _status_value(task.status)})
+    return APIResponse(data={"task_id": task.id, "status": status_value(task.status)})
 
 
 @app.get("/api/tasks")
