@@ -24,6 +24,7 @@ import json as _json
 
 from server.app.common_utils import status_value
 from server.app.database import init_db, new_session
+from server.app.chatops import init_chatops
 from server.app.event_bus import BUS, notify_diagnosis_complete
 from server.app.prometheus_metrics import record_http_request, REGISTRY
 from server.app.grpc_server import serve_in_background
@@ -53,6 +54,7 @@ async def _lifespan(_app: FastAPI):
     if os.getenv("MINIO_AUTO_CREATE_BUCKET", "0") == "1":
         _ensure_minio_bucket_with_retry(os.getenv("MINIO_BUCKET", "mini-drop"))
     _grpc = serve_in_background(repo)
+    init_chatops()
     yield
     _grpc.stop(grace=None).wait(timeout=5)
 

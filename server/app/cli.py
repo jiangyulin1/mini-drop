@@ -80,6 +80,13 @@ def main(argv: list[str] | None = None) -> int:
     p_completion = sub.add_parser("completion", help="print shell completion script")
     p_completion.add_argument("--shell", choices=["bash", "zsh", "powershell"], required=True)
 
+    p_chatops_config = sub.add_parser("chatops-config", help="print ChatOps provider and webhook configuration")
+    p_chatops_test = sub.add_parser("chatops-test", help="send a test message to the configured ChatOps webhook")
+    p_chatops_notify = sub.add_parser("chatops-notify", help="send a custom notification via ChatOps")
+    p_chatops_notify.add_argument("--title", required=True)
+    p_chatops_notify.add_argument("--content", required=True)
+    p_chatops_notify.add_argument("--level", choices=["info", "warning", "error", "success"], default="info")
+
     args = parser.parse_args(argv)
     return _COMMANDS[args.command](args)
 
@@ -305,51 +312,6 @@ class _TaskRecord:
         self.request_params = metadata.get("request_params", {})
 
 
-_COMMANDS = {
-    "serve": _cmd_serve,
-    "agent": _cmd_agent,
-    "ai-config": _cmd_ai_config,
-    "parse": _cmd_parse,
-    "summarize": _cmd_summarize,
-    "diagnose-local": _cmd_diagnose_local,
-    "diff-top": _cmd_diff_top,
-    "ci-check": _cmd_ci_check,
-    "alert": _cmd_alert,
-    "batch-diagnose": _cmd_batch_diagnose,
-    "export-summary": _cmd_export_summary,
-    "watch-task": _cmd_watch_task,
-    "keywords": _cmd_keywords,
-    "suggest": _cmd_suggest,
-    "completion": _cmd_completion,
-}
-
-
-_KEYWORDS = {
-    "commands": sorted(_COMMANDS.keys()),
-    "collectors": ["perf_cpu", "ebpf_io", "pyspy", "continuous_perf"],
-    "causes": [
-        "cpu_hotspot_recursive",
-        "io_wait_high",
-        "python_userland_hotspot",
-        "agent_overhead",
-        "collector_permission_denied",
-        "target_pid_invalid",
-        "insufficient_data",
-    ],
-    "fields": [
-        "top_functions",
-        "top_functions[0].name",
-        "top_functions[0].percent",
-        "ebpf_metrics.io_latency_us",
-        "baseline_diff",
-        "agent_stats.max_cpu_percent",
-        "task_metadata.status",
-        "failure_events",
-        "tool_results.get_flamegraph_top",
-    ],
-}
-
-
 def _filter_keywords(kind: str) -> dict[str, list[str]]:
     if kind == "all":
         return _KEYWORDS
@@ -384,6 +346,58 @@ def _completion_script(shell: str) -> str:
     )
 
 
+def _cmd_chatops_config(_args) -> int:
+    from server.app.chatops.dispatcher import is_enabled, _get_provider_name, _get_webhook_url
+    from server.app.chatops.providers import PROVIDERS
+    _print_json({
+        "enabled": is_enabled(),
+        "provider": _get_provider_name(),
+        "webhook_url": _get_webhook_url()[:40] + "…" if _get_webhook_url() else "",
+        "available_providers": sorted(PROVIDERS.keys()),
+    })
+    return 0
+
+
+def _cmd_chatops_test(_args) -> int:
+    from server.app.chatops.dispatcher import is_enabled, _get_provider_name, _get_webhook_url
+    from server.app.chatops.providers import PROVIDERS
+    from server.app.chatops.base import ChatopsMessage
+    if not is_enabled():
+        _print_json({"ok": False, "error": "ChatOps 未启用，请设置 MINI_DROP_CHATOPS_ENABLED=1 和相关环境变量"})
+        return 2
+    provider = PROVIDERS[_get_provider_name()]
+    msg = ChatopsMessage(
+        title="Mini-Drop ChatOps 连接测试",
+        content="这是一条来自 Mini-Drop 性能诊断平台的测试消息。\n\n如果你收到这条消息，说明 ChatOps Webhook 配置正确 ✅",
+        level="info",
+        extra_fields=[
+            {"label": "平台", "value": _get_provider_name()},
+            {"label": "时间", "value": __import__("datetime").datetime.now().isoformat()},
+        ],
+    )
+    ok = provider.send(msg, _get_webhook_url())
+    _print_json({"ok": ok, "provider": _get_provider_name()})
+    return 0 if ok else 1
+
+
+def _cmd_chatops_notify(args) -> int:
+    from server.app.chatops.dispatcher import is_enabled, _get_provider_name, _get_webhook_url
+    from server.app.chatops.providers import PROVIDERS
+    from server.app.chatops.base import ChatopsMessage
+    if not is_enabled():
+        _print_json({"ok": False, "error": "ChatOps 未启用"})
+        return 2
+    provider = PROVIDERS[_get_provider_name()]
+    msg = ChatopsMessage(
+        title=args.title,
+        content=args.content,
+        level=args.level,
+    )
+    ok = provider.send(msg, _get_webhook_url())
+    _print_json({"ok": ok, "provider": _get_provider_name()})
+    return 0 if ok else 1
+
+
 def _completion_words() -> list[str]:
     words = []
     for values in _KEYWORDS.values():
@@ -397,6 +411,54 @@ def _shell_single_quote(value: str) -> str:
 
 def _powershell_single_quote(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
+
+
+_COMMANDS = {
+    "serve": _cmd_serve,
+    "agent": _cmd_agent,
+    "ai-config": _cmd_ai_config,
+    "parse": _cmd_parse,
+    "summarize": _cmd_summarize,
+    "diagnose-local": _cmd_diagnose_local,
+    "diff-top": _cmd_diff_top,
+    "ci-check": _cmd_ci_check,
+    "alert": _cmd_alert,
+    "batch-diagnose": _cmd_batch_diagnose,
+    "export-summary": _cmd_export_summary,
+    "watch-task": _cmd_watch_task,
+    "keywords": _cmd_keywords,
+    "suggest": _cmd_suggest,
+    "completion": _cmd_completion,
+    "chatops-config": _cmd_chatops_config,
+    "chatops-test": _cmd_chatops_test,
+    "chatops-notify": _cmd_chatops_notify,
+}
+
+
+_KEYWORDS = {
+    "commands": sorted(_COMMANDS.keys()),
+    "collectors": ["perf_cpu", "ebpf_io", "pyspy", "continuous_perf"],
+    "causes": [
+        "cpu_hotspot_recursive",
+        "io_wait_high",
+        "python_userland_hotspot",
+        "agent_overhead",
+        "collector_permission_denied",
+        "target_pid_invalid",
+        "insufficient_data",
+    ],
+    "fields": [
+        "top_functions",
+        "top_functions[0].name",
+        "top_functions[0].percent",
+        "ebpf_metrics.io_latency_us",
+        "baseline_diff",
+        "agent_stats.max_cpu_percent",
+        "task_metadata.status",
+        "failure_events",
+        "tool_results.get_flamegraph_top",
+    ],
+}
 
 
 if __name__ == "__main__":
