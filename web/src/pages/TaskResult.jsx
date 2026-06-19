@@ -227,6 +227,8 @@ export default function TaskResult() {
 
   // ── 加载骨架屏 ────────────────────────────────────────
 
+  const FLAMEGRAPH_HEIGHT = 360;
+
   if (loading) {
     return (
       <Space direction="vertical" size={SPACING.lg} style={{ width: "100%" }}>
@@ -243,8 +245,6 @@ export default function TaskResult() {
       </Space>
     );
   }
-
-  const FLAMEGRAPH_HEIGHT = 360;
 
   // ── 主渲染 ────────────────────────────────────────────
 
