@@ -188,6 +188,11 @@ def init_chatops() -> None:
         log_event("error", "chatops_invalid_webhook_url", provider=provider_name, url=webhook_url[:80])
         return
 
+    # qqbot 额外校验：必须设置目标群号
+    if provider_name == "qqbot" and not os.getenv("MINI_DROP_QQBOT_TARGET_ID", "").strip():
+        log_event("error", "chatops_qqbot_no_target", hint="请设置 MINI_DROP_QQBOT_TARGET_ID 为目标群号或 QQ 号")
+        return
+
     log_event("info", "chatops_initialized", provider=provider_name)
 
     # 订阅事件总线，后台线程持续监听
