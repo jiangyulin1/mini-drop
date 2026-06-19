@@ -193,6 +193,11 @@ def init_chatops() -> None:
         log_event("error", "chatops_qqbot_no_target", hint="请设置 MINI_DROP_QQBOT_TARGET_ID 为目标群号或 QQ 号")
         return
 
+    # qqbot WebSocket 模式：启动内嵌 WS 服务端
+    if provider_name == "qqbot" and webhook_url.startswith("ws"):
+        from server.app.chatops.providers.qqbot import QQBotProvider
+        QQBotProvider.start_ws_server(webhook_url)
+
     log_event("info", "chatops_initialized", provider=provider_name)
 
     # 订阅事件总线，后台线程持续监听

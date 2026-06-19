@@ -24,6 +24,9 @@ dev = [
     "pytest-cov",
     "loguru",
 ]
+chatops = [
+    "websockets>=10.0",
+]
 
 [project.scripts]
 micro-drop = "server.app.cli:main"
