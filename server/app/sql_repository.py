@@ -35,6 +35,7 @@ from server.app.models import (
     StatusEventModel,
     TaskModel,
 )
+from server.app.prometheus_metrics import record_task_transition
 from server.app.rca.models import FeedbackPrior
 from server.app.schemas import CreateTaskRequest
 from server.app.state_machine import (
@@ -289,6 +290,7 @@ class SqlRepository:
             # 状态事件
             self._write_event(session, task_id, None, TaskStatus.PENDING,
                               "Web 请求创建任务", Actor.WEB, payload.model_dump())
+            record_task_transition("NONE", TaskStatus.PENDING.value)
 
             # 审计日志
             self._write_audit(session, "TASK_CREATED", task_id=task_id,
@@ -624,15 +626,17 @@ class SqlRepository:
     ) -> None:
         task = session.get(TaskModel, task_id)
         # 事件：from 用旧 status value
+        from_status = task.status
         session.add(StatusEventModel(
             task_id=task_id,
-            from_status=task.status,
+            from_status=from_status,
             to_status=to_status.value,
             reason=reason,
             actor=actor.value,
             meta_json=metadata or {},
             created_at=now_utc(),
         ))
+        record_task_transition(from_status, to_status.value)
         task.status = to_status.value
         task.status_reason = reason
         if to_status == TaskStatus.RUNNING and task.started_at is None:

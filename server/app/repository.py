@@ -15,6 +15,7 @@ from typing import Any
 from uuid import uuid4
 
 from server.app.schemas import AgentRegistration, CreateTaskRequest
+from server.app.prometheus_metrics import record_task_transition
 from server.app.state_machine import (
     Actor,
     StatusEvent,
@@ -232,6 +233,7 @@ class InMemoryRepository:
                     payload.model_dump(),
                 )
             )
+            record_task_transition("NONE", TaskStatus.PENDING.value)
 
             # 审计日志
             self._append_audit(
@@ -266,6 +268,7 @@ class InMemoryRepository:
                 task_id, task.status, to_status, reason, actor, metadata,
             )
             self.events.append(event)
+            record_task_transition(task.status.value, to_status.value)
             task.status = to_status
             task.status_reason = reason
             if to_status == TaskStatus.RUNNING and task.started_at is None:

@@ -41,6 +41,13 @@ class MetricsRegistry:
             if len(self._histograms[name]) > 10000:
                 self._histograms[name] = self._histograms[name][-5000:]
 
+    def clear(self) -> None:
+        """清空所有指标，主要供测试隔离使用。"""
+        with self._lock:
+            self._counters.clear()
+            self._gauges.clear()
+            self._histograms.clear()
+
     def generate(self) -> str:
         """生成 Prometheus 文本格式。"""
         lines: list[str] = []

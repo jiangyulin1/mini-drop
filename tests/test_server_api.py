@@ -15,6 +15,7 @@ from server.app import storage as store
 from server.app.database import init_db, reset_engine
 from server.app.main import _ensure_minio_bucket_with_retry, app, repo
 from server.app.models import Base
+from server.app.prometheus_metrics import REGISTRY
 from server.app.state_machine import Actor, TaskStatus
 
 
@@ -25,6 +26,7 @@ def _reset_repo(monkeypatch):
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     monkeypatch.delenv("MINI_DROP_API_AUTH_ENABLED", raising=False)
     monkeypatch.delenv("MINI_DROP_API_KEY", raising=False)
+    REGISTRY.clear()
     reset_engine()
     init_db()
     repo._task_queues.clear()
@@ -116,6 +118,13 @@ class TestApiAuth:
         monkeypatch.setenv("MINI_DROP_API_KEY", "secret-token")
         resp = client.get("/api/healthz")
         assert resp.status_code == 200
+
+    def test_metrics_stays_public_when_auth_enabled(self, client: TestClient, monkeypatch):
+        monkeypatch.setenv("MINI_DROP_API_AUTH_ENABLED", "1")
+        monkeypatch.setenv("MINI_DROP_API_KEY", "secret-token")
+        resp = client.get("/api/metrics")
+        assert resp.status_code == 200
+        assert "mini_drop" in resp.text or resp.text.strip() == ""
 
 
 class TestAgents:
@@ -268,6 +277,11 @@ class TestTaskEvents:
         events = client.get(f"/api/tasks/{task_id}/events").json()["data"]
         statuses = [e["to_status"] for e in events]
         assert statuses == ["PENDING", "RUNNING", "UPLOADING"]
+
+        metrics = client.get("/api/metrics").text
+        assert 'mini_drop_task_transitions_total{from="NONE",to="PENDING"}' in metrics
+        assert 'mini_drop_task_transitions_total{from="PENDING",to="RUNNING"}' in metrics
+        assert 'mini_drop_task_transitions_total{from="RUNNING",to="UPLOADING"}' in metrics
 
     def test_events_404_for_nonexistent_task(self, client: TestClient):
         resp = client.get("/api/tasks/does-not-exist/events")
@@ -459,6 +473,9 @@ class TestDiagnose:
         assert len(detail["tool_results"]) >= 1
         history = client.get(f"/api/tasks/{task_id}/diagnoses").json()["data"]
         assert history[0]["id"] == diag["diagnosis_id"]
+
+        metrics = client.get("/api/metrics").text
+        assert 'mini_drop_diagnosis_total{status="' in metrics
 
         feedback = client.post(
             f"/api/diagnoses/{diag['diagnosis_id']}/feedback",
