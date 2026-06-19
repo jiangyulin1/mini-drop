@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from server.app.ai_provider import get_ai_settings, is_feature_enabled
+from server.app.ai_provider import chat_completions, get_ai_settings, is_feature_enabled
 
 SUMMARIZE_SYSTEM_PROMPT = """你是 Mini-Drop 性能诊断报告撰写助手。
 
@@ -37,15 +37,9 @@ def summarize(
         data_text += f"\n规则建议: {'; '.join(suggestions[:3])}"
 
     try:
-        settings = get_ai_settings()
-        resp = _post_json(
-            f"{settings.base_url}/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {settings.api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": settings.model,
+        resp = chat_completions(
+            {
+                "model": get_ai_settings().model,
                 "messages": [
                     {"role": "system", "content": SUMMARIZE_SYSTEM_PROMPT},
                     {"role": "user", "content": data_text},
@@ -112,8 +106,3 @@ def _template_summary(top_functions: list[dict], suggestions: list[str]) -> str:
 def json_dumps(obj, **kw):
     import json
     return json.dumps(obj, ensure_ascii=False, **kw)
-
-
-def _post_json(url: str, headers: dict, json: dict, timeout: int):
-    from server.app.ai_provider import chat_completions
-    return chat_completions(json, timeout=timeout)

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 
-from server.app.ai_provider import get_ai_settings, is_feature_enabled
+from server.app.ai_provider import chat_completions, get_ai_settings, is_feature_enabled
 from server.app.nlp.tool_schemas import CREATE_PROFILING_TASK_SCHEMA, NLP_SYSTEM_PROMPT
 from server.app.schemas import MAX_SAMPLE_RATE, MAX_TASK_DURATION_SEC, MIN_SAMPLE_RATE
 
@@ -62,26 +62,18 @@ def parse_intent(user_input: str) -> StructuredIntent:
     ]
 
     try:
-        settings = get_ai_settings()
-        resp = _post_json(
-            f"{settings.base_url}/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {settings.api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": settings.model,
-                "messages": messages,
-                "temperature": 0.1,
-                "max_tokens": 512,
-                "tools": [{
-                    "type": "function",
-                    "function": CREATE_PROFILING_TASK_SCHEMA,
-                }],
-                "tool_choice": {"type": "function", "function": {"name": "create_profiling_task"}},
-            },
-            timeout=20,
-        )
+        payload = {
+            "model": get_ai_settings().model,
+            "messages": messages,
+            "temperature": 0.1,
+            "max_tokens": 512,
+            "tools": [{
+                "type": "function",
+                "function": CREATE_PROFILING_TASK_SCHEMA,
+            }],
+            "tool_choice": {"type": "function", "function": {"name": "create_profiling_task"}},
+        }
+        resp = chat_completions(payload, timeout=20)
 
         if resp.status_code != 200:
             return _keyword_fallback(user_input.strip())
@@ -125,10 +117,6 @@ def _clamp_and_validate(args: dict) -> StructuredIntent:
         raw_llm_output=args,
     )
 
-
-def _post_json(url: str, headers: dict, json: dict, timeout: int):
-    from server.app.ai_provider import chat_completions
-    return chat_completions(json, timeout=timeout)
 
 
 def _keyword_fallback(text: str) -> StructuredIntent:

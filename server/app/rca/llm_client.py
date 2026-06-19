@@ -9,7 +9,7 @@ import json
 import re
 import time
 
-from server.app.ai_provider import is_feature_enabled
+from server.app.ai_provider import chat_completions, is_feature_enabled
 from server.app.rca.models import CauseEntry, DiagnosisReport, EvidenceInput, ValidatedReport
 from server.app.rca.prompt import build_system_prompt, build_user_message
 
@@ -115,10 +115,8 @@ def _call_deepseek(messages: list[dict], model: str) -> str:
     Raises:
         RuntimeError: API 返回非 200。
     """
-    resp = _post_json(
-        "",
-        headers={},
-        json={
+    resp = chat_completions(
+        {
             "model": model,
             "messages": messages,
             "temperature": 0.1,  # 低温：归因需要确定性而非创意
@@ -135,10 +133,6 @@ def _call_deepseek(messages: list[dict], model: str) -> str:
     content = body["choices"][0]["message"]["content"]
     return content
 
-
-def _post_json(url: str, headers: dict, json: dict, timeout: int):
-    from server.app.ai_provider import chat_completions
-    return chat_completions(json, timeout=timeout)
 
 
 def _validate_and_parse(raw: str, evidence: EvidenceInput) -> tuple[DiagnosisReport | None, list[str]]:

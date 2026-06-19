@@ -19,7 +19,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from server.app.common_utils import status_value
-from server.app.database import init_db
+from server.app.database import init_db, new_session
 from server.app.grpc_server import serve_in_background
 from server.app.logging_utils import log_event
 from server.app.nlp.intent_parser import parse_intent
@@ -160,7 +160,41 @@ def _extract_api_token(request: Request) -> str | None:
 
 @app.get("/api/healthz")
 def healthz() -> APIResponse:
-    return APIResponse(data={"service": "mini-drop-server", "version": "0.1.0"})
+    """健康检查端点：验证服务自身及关键依赖（数据库、对象存储）的状态。
+
+    Kubernetes liveness/readiness probe 可通过此端点区分：
+      - 200 + healthy=true  → 服务完全可用
+      - 200 + healthy=false → 服务存活但依赖不可用（readiness 应标记为未就绪）
+      - 非 200               → 服务未存活
+    """
+    checks: dict[str, dict] = {}
+
+    # 数据库连通性检查
+    try:
+        from sqlalchemy import text as _sa_text
+        session = new_session()
+        try:
+            session.execute(_sa_text("SELECT 1"))
+        finally:
+            session.close()
+        checks["database"] = {"status": "ok"}
+    except Exception as exc:
+        checks["database"] = {"status": "unavailable", "error": str(exc)[:200]}
+
+    # 对象存储连通性检查
+    try:
+        store.ensure_bucket(os.getenv("MINIO_BUCKET", "mini-drop"))
+        checks["storage"] = {"status": "ok"}
+    except Exception as exc:
+        checks["storage"] = {"status": "unavailable", "error": str(exc)[:200]}
+
+    all_ok = all(c["status"] == "ok" for c in checks.values())
+    return APIResponse(data={
+        "service": "mini-drop-server",
+        "version": "0.1.0",
+        "healthy": all_ok,
+        "checks": checks,
+    })
 
 
 @app.get("/api/me")
