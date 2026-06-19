@@ -25,13 +25,11 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import os
 import threading
-import time
 from typing import Any
-
-import requests
 
 from server.app.chatops.base import BaseProvider, ChatopsMessage
 from server.app.logging_utils import log_event
@@ -57,8 +55,10 @@ class QQBotProvider(BaseProvider):
     # WebSocket 模式状态
     _ws_server_started = False
     _ws_lock = threading.Lock()
-    _ws_pending_actions: dict[str, asyncio.Future] = {}
+    _ws_pending_actions: dict[str, concurrent.futures.Future] = {}
+    _ws_pending_lock = threading.Lock()
     _ws_connections: dict = {}
+    _ws_loops: dict = {}
     _ws_echo_seq = 0
     _ws_seq_lock = threading.Lock()
 
@@ -95,6 +95,7 @@ class QQBotProvider(BaseProvider):
     def _send_http(self, base_url: str, action: str, params: dict) -> bool:
         endpoint = f"{base_url.rstrip('/')}/{action}"
         try:
+            import requests
             resp = requests.post(endpoint, json=params, timeout=10)
             return resp.status_code == 200 and resp.json().get("status") == "ok"
         except Exception:
@@ -104,40 +105,34 @@ class QQBotProvider(BaseProvider):
 
     def _send_ws(self, bind_url: str, params: dict) -> bool:
         host, port = self._parse_ws_bind(bind_url)
-        conn = self._ws_connections.get((host, port))
-        if conn is None:
+        key = (host, port)
+        conn = self._ws_connections.get(key)
+        loop = self._ws_loops.get(key)
+        if conn is None or loop is None:
             return False
 
         try:
-            import websockets
             seq = self._next_seq()
             params["echo"] = seq
-            future: asyncio.Future = asyncio.get_event_loop().create_future()
-            self._ws_pending_actions[str(seq)] = future
-
-            asyncio.get_event_loop().call_soon_threadsafe(
-                lambda: asyncio.ensure_future(self._ws_send_and_wait(conn, params, future))
-            )
+            response_future: concurrent.futures.Future = concurrent.futures.Future()
+            with self._ws_pending_lock:
+                self._ws_pending_actions[str(seq)] = response_future
 
             try:
-                result = future.result(timeout=15)
+                send_future = asyncio.run_coroutine_threadsafe(
+                    conn.send(json.dumps(params, ensure_ascii=False)),
+                    loop,
+                )
+                send_future.result(timeout=5)
+                result = response_future.result(timeout=15)
                 return result.get("status") == "ok"
             except Exception:
+                with self._ws_pending_lock:
+                    self._ws_pending_actions.pop(str(seq), None)
                 return False
-        except ImportError:
-            log_event("error", "chatops_qqbot_ws_no_websockets_lib",
-                      hint="pip install websockets")
-            return False
         except Exception as exc:
             log_event("warning", "chatops_qqbot_ws_send_failed", error=str(exc)[:100])
             return False
-
-    async def _ws_send_and_wait(self, conn, params: dict, future: asyncio.Future):
-        try:
-            await conn.send(json.dumps(params, ensure_ascii=False))
-        except Exception as exc:
-            if not future.done():
-                future.set_exception(exc)
 
     @staticmethod
     def _parse_ws_bind(url: str):
@@ -170,10 +165,13 @@ class QQBotProvider(BaseProvider):
         def _run():
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
+            cls._ws_loops[key] = loop
             try:
                 loop.run_until_complete(cls._ws_serve(host, port, key))
             except Exception as exc:
                 log_event("error", "chatops_qqbot_ws_server_error", error=str(exc)[:100])
+            finally:
+                cls._ws_loops.pop(key, None)
 
         t = threading.Thread(target=_run, daemon=True, name="qqbot-ws-server")
         t.start()
@@ -197,7 +195,8 @@ class QQBotProvider(BaseProvider):
                         data = json.loads(raw)
                         if "echo" in data:
                             echo_key = str(data["echo"])
-                            future = cls._ws_pending_actions.pop(echo_key, None)
+                            with cls._ws_pending_lock:
+                                future = cls._ws_pending_actions.pop(echo_key, None)
                             if future and not future.done():
                                 future.set_result(data)
                     except json.JSONDecodeError:

@@ -5,8 +5,6 @@ from __future__ import annotations
 import json
 import re
 
-import requests
-
 from server.app.chatops.base import BaseProvider, ChatopsMessage
 
 
@@ -23,6 +21,7 @@ class WeComProvider(BaseProvider):
     def send(self, message: ChatopsMessage, webhook_url: str) -> bool:
         payload = self._build_payload(message)
         try:
+            import requests
             resp = requests.post(webhook_url, json=payload, timeout=10)
             return resp.status_code == 200
         except Exception:
@@ -55,4 +54,5 @@ class WeComProvider(BaseProvider):
 
 
 def _post_json(url: str, payload: dict, timeout: int = 10):
+    import requests
     return requests.post(url, json=payload, timeout=timeout)

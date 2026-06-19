@@ -61,14 +61,19 @@ export function healthz() {
   return api.get("/healthz");
 }
 
+function itemsOf(value) {
+  if (Array.isArray(value)) return value;
+  return value?.items || [];
+}
+
 // ── Agent ────────────────────────────────────────────────────────
 
 export function listAgents() {
-  return api.get("/agents");
+  return api.get("/agents").then(itemsOf);
 }
 
 export function listAuditLogs() {
-  return api.get("/audit-logs");
+  return api.get("/audit-logs").then(itemsOf);
 }
 
 // ── 任务 ────────────────────────────────────────────────────────

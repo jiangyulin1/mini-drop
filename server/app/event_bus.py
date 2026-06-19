@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import queue
 import threading
 from datetime import datetime, timezone
 from typing import Any
@@ -22,7 +23,7 @@ class EventBus:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._subscribers: list[asyncio.Queue] = []
+        self._subscribers: list[queue.Queue] = []
         self._history: list[dict[str, Any]] = []
 
     def publish(self, event_type: str, data: dict[str, Any]) -> None:
@@ -36,23 +37,23 @@ class EventBus:
             self._history.append(event)
             if len(self._history) > MAX_HISTORY:
                 self._history = self._history[-MAX_HISTORY:]
-            dead: list[asyncio.Queue] = []
+            dead: list[queue.Queue] = []
             for q in self._subscribers:
                 try:
                     q.put_nowait(event)
-                except asyncio.QueueFull:
+                except queue.Full:
                     dead.append(q)
             for q in dead:
                 self._subscribers.remove(q)
 
-    def subscribe(self) -> asyncio.Queue:
+    def subscribe(self) -> queue.Queue:
         """注册一个订阅者队列。调用方负责取消订阅时 clean up。"""
-        q: asyncio.Queue = asyncio.Queue(maxsize=256)
+        q: queue.Queue = queue.Queue(maxsize=256)
         with self._lock:
             self._subscribers.append(q)
         return q
 
-    def unsubscribe(self, q: asyncio.Queue) -> None:
+    def unsubscribe(self, q: queue.Queue) -> None:
         """取消订阅。"""
         with self._lock:
             try:

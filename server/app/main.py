@@ -21,12 +21,13 @@ from fastapi.responses import JSONResponse
 
 import asyncio
 import json as _json
+import queue as _queue
 
 from server.app.common_utils import status_value
 from server.app.database import init_db, new_session
 from server.app.chatops import init_chatops
 from server.app.event_bus import BUS, notify_diagnosis_complete
-from server.app.prometheus_metrics import record_http_request, REGISTRY
+from server.app.prometheus_metrics import record_diagnosis, record_http_request, REGISTRY
 from server.app.grpc_server import serve_in_background
 from server.app.logging_utils import log_event
 from server.app.nlp.intent_parser import parse_intent
@@ -177,7 +178,7 @@ def _requires_api_auth(request: Request) -> bool:
     if os.getenv("MINI_DROP_API_AUTH_ENABLED", "0").strip().lower() not in {"1", "true", "yes", "on"}:
         return False
     path = request.url.path
-    return path.startswith("/api/") and path != "/api/healthz"
+    return path.startswith("/api/") and path not in {"/api/healthz", "/api/metrics"}
 
 
 def _extract_api_token(request: Request) -> str | None:
@@ -212,9 +213,9 @@ async def sse_stream(request: Request, since: str = ""):
             # 持续推送新事件
             while True:
                 try:
-                    event = await asyncio.wait_for(queue.get(), timeout=30.0)
+                    event = await asyncio.to_thread(queue.get, True, 30.0)
                     yield f"event: {event['event']}\ndata: {_json.dumps(event['data'], ensure_ascii=False, default=str)}\n\n"
-                except asyncio.TimeoutError:
+                except _queue.Empty:
                     # 每 30 秒发一个注释行保活
                     yield ":keepalive\n\n"
         except asyncio.CancelledError:
@@ -493,6 +494,7 @@ def diagnose_task(task_id: str) -> APIResponse:
         validated=report.validated,
         retry_count=report.retry_count,
     )
+    record_diagnosis(diag_status)
 
     notify_diagnosis_complete(task_id, diagnosis_id, diag_status)
 

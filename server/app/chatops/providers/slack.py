@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import re
 
-import requests
-
 from server.app.chatops.base import BaseProvider, ChatopsMessage
 
 
@@ -28,6 +26,7 @@ class SlackProvider(BaseProvider):
     def send(self, message: ChatopsMessage, webhook_url: str) -> bool:
         payload = self._build_payload(message)
         try:
+            import requests
             resp = requests.post(webhook_url, json=payload, timeout=10)
             return resp.status_code == 200
         except Exception:
