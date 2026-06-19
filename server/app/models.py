@@ -298,3 +298,32 @@ class RCAFeedbackWeightModel(Base):
     partial_count = Column(Integer, default=0)
     weight_delta = Column(Integer, default=0)
     updated_at = Column(DateTime(timezone=True), nullable=False)
+
+
+# ── Agent 指标快照 ───────────────────────────────────────────────
+
+
+class AgentMetricSnapshotModel(Base):
+    """Agent 周期性资源开销快照，用于趋势分析和容量规划。"""
+
+    __tablename__ = "agent_metric_snapshots"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    agent_id = Column(String(128), ForeignKey("agents.id"), nullable=False, index=True)
+    cpu_percent = Column(Integer, default=0)
+    rss_mb = Column(Integer, default=0)
+    read_kb_s = Column(Integer, default=0)
+    write_kb_s = Column(Integer, default=0)
+    children_count = Column(Integer, default=0)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+
+    def to_dict(self) -> dict:
+        return {
+            "agent_id": self.agent_id,
+            "cpu_percent": self.cpu_percent,
+            "rss_mb": self.rss_mb,
+            "read_kb_s": self.read_kb_s,
+            "write_kb_s": self.write_kb_s,
+            "children_count": self.children_count,
+            "created_at": self.created_at,
+        }

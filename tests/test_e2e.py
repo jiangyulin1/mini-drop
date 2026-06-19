@@ -183,14 +183,16 @@ class TestE2EAgentOffline:
         assert repo.agents[agent_id].status == "OFFLINE"
 
         # 审计日志中应有 AGENT_OFFLINE 记录
-        logs = client.get("/api/audit-logs").json()["data"]
-        offline_logs = [l for l in logs if l["event_type"] == "AGENT_OFFLINE"]
+        log_resp = client.get("/api/audit-logs").json()["data"]
+        log_items = log_resp if isinstance(log_resp, list) else log_resp.get("items", [])
+        offline_logs = [l for l in log_items if l["event_type"] == "AGENT_OFFLINE"]
         assert len(offline_logs) >= 1
 
         # 再次注册 → AGENT_ONLINE 审计日志
         repo.register_agent(agent_id, "offline-host", "10.0.0.200")
-        logs = client.get("/api/audit-logs").json()["data"]
-        online_logs = [l for l in logs if l["event_type"] == "AGENT_ONLINE"]
+        log_resp = client.get("/api/audit-logs").json()["data"]
+        log_items = log_resp if isinstance(log_resp, list) else log_resp.get("items", [])
+        online_logs = [l for l in log_items if l["event_type"] == "AGENT_ONLINE"]
         assert len(online_logs) >= 1
 
 

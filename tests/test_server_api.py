@@ -126,7 +126,8 @@ class TestAgents:
         })
         resp = client.get("/api/agents")
         assert resp.status_code == 200
-        agents = resp.json()["data"]
+        data = resp.json()["data"]
+        agents = data if isinstance(data, list) else data.get("items", [])
         agent = next(item for item in agents if item["id"] == "a1")
         assert agent["latest_metrics"]["self"]["cpu_percent"] == 1.5
 
@@ -168,7 +169,8 @@ class TestCreateTask:
             "name": "test", "agent_id": "a2",
             "target_pid": 1, "collector_type": "perf_cpu",
         })
-        logs = client.get("/api/audit-logs").json()["data"]
+        log_data = client.get("/api/audit-logs").json()["data"]
+        logs = log_data if isinstance(log_data, list) else log_data.get("items", [])
         assert any(log["event_type"] == "TASK_CREATED" for log in logs)
 
     def test_rejects_zero_duration(self, client: TestClient):

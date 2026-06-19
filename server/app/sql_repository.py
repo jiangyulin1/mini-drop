@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import json
 import threading
+import time
+
+from server.app.event_bus import notify_task_changed, notify_agent_status
 from collections import deque
 from contextlib import contextmanager
 from dataclasses import asdict
@@ -19,6 +22,7 @@ from sqlalchemy.orm import Session as OrmSession
 
 from server.app.database import new_session
 from server.app.models import (
+    AgentMetricSnapshotModel,
     AgentModel,
     ArtifactModel,
     AuditLogModel,
@@ -50,13 +54,29 @@ class SqlRepository:
         # Compatibility shim for older tests; dispatch now reads PENDING tasks from DB.
         self._task_queues: dict[str, deque[str]] = {}
         self.agent_metrics: dict[str, dict[str, Any]] = {}
+        # TTL 缓存：key → (expires_at, value)
+        self._cache: dict[str, tuple[float, Any]] = {}
+
+    def _cached(self, key: str, ttl_sec: float, factory):
+        """带 TTL 的简单缓存。
+
+        如果 key 未过期则返回缓存值，否则调用 factory() 重新计算并缓存。
+        """
+        now = time.monotonic()
+        if key in self._cache:
+            expires_at, value = self._cache[key]
+            if now < expires_at:
+                return value
+        value = factory()
+        self._cache[key] = (now + ttl_sec, value)
+        return value
 
     @contextmanager
     def _write_session(self):
-        """写事务 context manager：加锁 → 建 session → 提交/回滚 → 关闭。
+        """写事务 context manager：加锁 → 建 session → 提交/回滚 → 关闭 → 清缓存。
 
         用于 register_agent / create_task / transition_task 等写操作。
-        自动处理 lock → new_session → commit → close 的重复模板。
+        自动处理 lock → new_session → commit → close → cache_invalidation。
         """
         with self._lock:
             session = new_session()
@@ -68,6 +88,8 @@ class SqlRepository:
                 raise
             finally:
                 session.close()
+            # 写入后清除所有 TTL 缓存，确保下次读取拿到最新数据
+            self._cache.clear()
 
     @contextmanager
     def _read_session(self):
@@ -124,6 +146,7 @@ class SqlRepository:
             if ip_addr not in self._task_queues:
                 self._task_queues[ip_addr] = deque()
 
+            notify_agent_status(agent_id, "ONLINE", ip_addr)
             return agent
 
     def heartbeat(self, agent_id: str, ip_addr: str) -> TaskModel | None:
@@ -173,13 +196,23 @@ class SqlRepository:
                     session, "AGENT_OFFLINE", agent.id,
                     f"{agent.id} 心跳超时 {timeout_sec}s，标记为离线",
                 )
+                notify_agent_status(agent.id, "OFFLINE", agent.ip_addr)
             return changed
 
     @property
     def agents(self) -> dict[str, AgentModel]:
-        """返回 {agent_id: AgentModel} 字典（兼容旧接口的 dict 访问）。"""
-        with self._read_session() as session:
-            return {a.id: a for a in session.query(AgentModel).all()}
+        """返回 {agent_id: AgentModel} 字典（兼容旧接口的 dict 访问）。
+
+        2 秒 TTL 缓存，避免高频场景下每请求查全表。
+        """
+        return self._cached("agents", 2.0, lambda: self._query_all_agents())
+
+    def _query_all_agents(self) -> dict[str, AgentModel]:
+        s = new_session()
+        try:
+            return {a.id: a for a in s.query(AgentModel).all()}
+        finally:
+            s.close()
 
     def find_agent_by_ip(self, ip_addr: str) -> AgentModel | None:
         with self._read_session() as session:
@@ -188,6 +221,41 @@ class SqlRepository:
     def record_agent_metrics(self, agent_id: str, metrics: dict[str, Any]) -> None:
         with self._lock:
             self.agent_metrics[agent_id] = dict(metrics)
+
+    def persist_agent_metric_snapshots(self) -> int:
+        """将内存中的 agent metrics 批量写入数据库快照表。
+
+        每次调用对所有在线 agent 生成一条快照记录，用于趋势分析。
+        返回写入的快照数量。
+        """
+        with self._write_session() as session:
+            ts = now_utc()
+            count = 0
+            for agent_id, metrics in self.agent_metrics.items():
+                self_data = metrics.get("self", {})
+                session.add(AgentMetricSnapshotModel(
+                    agent_id=agent_id,
+                    cpu_percent=int(self_data.get("cpu_percent", 0) or 0),
+                    rss_mb=int(self_data.get("rss_mb", 0) or 0),
+                    read_kb_s=int(self_data.get("read_kb_s", 0) or 0),
+                    write_kb_s=int(self_data.get("write_kb_s", 0) or 0),
+                    children_count=int(self_data.get("children_count", 0) or 0),
+                    created_at=ts,
+                ))
+                count += 1
+            return count
+
+    def get_agent_metric_history(self, agent_id: str, limit: int = 100) -> list[dict[str, Any]]:
+        """查询指定 Agent 的历史指标快照。"""
+        with self._read_session() as session:
+            rows = (
+                session.query(AgentMetricSnapshotModel)
+                .filter(AgentMetricSnapshotModel.agent_id == agent_id)
+                .order_by(AgentMetricSnapshotModel.created_at.desc())
+                .limit(limit)
+                .all()
+            )
+            return [row.to_dict() for row in rows]
 
     # ------------------------------------------------------------------
     # Task
@@ -252,14 +320,24 @@ class SqlRepository:
 
     @property
     def tasks(self) -> dict[str, TaskModel]:
-        with self._read_session() as session:
-            return {t.id: t for t in session.query(TaskModel).all()}
+        return self._cached("tasks", 2.0, self._query_all_tasks)
+
+    def _query_all_tasks(self) -> dict[str, TaskModel]:
+        s = new_session()
+        try:
+            return {t.id: t for t in s.query(TaskModel).all()}
+        finally:
+            s.close()
 
     @property
     def events(self) -> list[StatusEvent]:
         """返回所有状态事件，兼容原有 list[StatusEvent] 接口。"""
-        with self._read_session() as session:
-            models = session.query(StatusEventModel).all()
+        return self._cached("events", 2.0, self._query_all_events)
+
+    def _query_all_events(self) -> list[StatusEvent]:
+        s = new_session()
+        try:
+            models = s.query(StatusEventModel).all()
             result: list[StatusEvent] = []
             for m in models:
                 result.append(StatusEvent(
@@ -272,6 +350,8 @@ class SqlRepository:
                     created_at=m.created_at if m.created_at else now_utc(),
                 ))
             return result
+        finally:
+            s.close()
 
     # ------------------------------------------------------------------
     # Artifacts
@@ -296,12 +376,18 @@ class SqlRepository:
 
     @property
     def artifacts(self) -> dict[str, list[dict[str, Any]]]:
-        with self._read_session() as session:
+        return self._cached("artifacts", 2.0, self._query_all_artifacts)
+
+    def _query_all_artifacts(self) -> dict[str, list[dict[str, Any]]]:
+        s = new_session()
+        try:
             result: dict[str, list[dict[str, Any]]] = {}
-            for art in session.query(ArtifactModel).all():
+            for art in s.query(ArtifactModel).all():
                 tid = art.task_id if art.task_id else ""
                 result.setdefault(tid, []).append(art.to_dict())
             return result
+        finally:
+            s.close()
 
     # ------------------------------------------------------------------
     # Audit
@@ -323,8 +409,14 @@ class SqlRepository:
 
     @property
     def audit_logs(self) -> list[AuditLogModel]:
-        with self._read_session() as session:
-            return session.query(AuditLogModel).all()
+        return self._cached("audit_logs", 5.0, self._query_all_audit_logs)
+
+    def _query_all_audit_logs(self) -> list[AuditLogModel]:
+        s = new_session()
+        try:
+            return s.query(AuditLogModel).all()
+        finally:
+            s.close()
 
     # ------------------------------------------------------------------
     # RCA
@@ -547,6 +639,9 @@ class SqlRepository:
             task.started_at = now_utc()
         if to_status in (TaskStatus.DONE, TaskStatus.FAILED):
             task.finished_at = now_utc()
+
+        # 发布 SSE 事件
+        notify_task_changed(task_id, task.status, to_status.value, reason)
 
     def as_dict(self, value: Any) -> dict[str, Any]:
         if isinstance(value, StatusEvent):

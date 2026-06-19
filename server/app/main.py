@@ -16,10 +16,16 @@ from contextlib import asynccontextmanager
 from pathlib import Path as _Path
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+
+import asyncio
+import json as _json
 
 from server.app.common_utils import status_value
 from server.app.database import init_db, new_session
+from server.app.event_bus import BUS, notify_diagnosis_complete
+from server.app.prometheus_metrics import record_http_request, REGISTRY
 from server.app.grpc_server import serve_in_background
 from server.app.logging_utils import log_event
 from server.app.nlp.intent_parser import parse_intent
@@ -73,11 +79,31 @@ def _ensure_minio_bucket_with_retry(bucket: str) -> None:
             if attempt < attempts and delay_sec > 0:
                 time.sleep(delay_sec)
 
-    assert last_exc is not None
+    if last_exc is None:
+        raise RuntimeError("minio_bucket_init_failed: all retries exhausted with no exception")
     raise last_exc
 
 
 app = FastAPI(title="Mini-Drop Server", version="0.1.0", lifespan=_lifespan)
+
+# CORS 中间件：允许前端跨域开发访问
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=os.getenv("MINI_DROP_CORS_ORIGINS", "http://localhost:5173").split(","),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# request-id 中间件：为每个 HTTP 请求生成唯一 ID，注入响应头、请求状态和结构化日志
+@app.middleware("http")
+async def _request_id(request: Request, call_next):
+    import uuid
+    rid = request.headers.get("x-request-id", uuid.uuid4().hex[:12])
+    request.state.request_id = rid
+    response = await call_next(request)
+    response.headers["x-request-id"] = rid
+    return response
 
 
 @app.middleware("http")
@@ -89,6 +115,7 @@ async def _access_log(request: Request, call_next):
         log_event(
             "error",
             "http_request_failed",
+            request_id=getattr(request.state, "request_id", ""),
             method=request.method,
             path=request.url.path,
             error=type(exc).__name__,
@@ -96,14 +123,17 @@ async def _access_log(request: Request, call_next):
         )
         raise
 
+    latency_ms = round((time.perf_counter() - start) * 1000, 2)
     log_event(
         "info",
         "http_request",
+        request_id=getattr(request.state, "request_id", ""),
         method=request.method,
         path=request.url.path,
         status_code=response.status_code,
-        latency_ms=round((time.perf_counter() - start) * 1000, 2),
+        latency_ms=latency_ms,
     )
+    record_http_request(request.method, request.url.path, response.status_code, latency_ms)
     return response
 
 
@@ -158,6 +188,60 @@ def _extract_api_token(request: Request) -> str | None:
 # ── 通用 ──────────────────────────────────────────────────────
 
 
+@app.get("/api/events/stream")
+async def sse_stream(request: Request, since: str = ""):
+    """Server-Sent Events 实时推送。
+
+    客户端通过 EventSource 连接此端点，接收任务状态变更、
+    Agent 上下线、诊断完成等实时事件。
+
+    用法：const es = new EventSource('/api/events/stream');
+          es.onmessage = (e) => console.log(JSON.parse(e.data));
+    """
+    from fastapi.responses import StreamingResponse
+
+    async def event_generator():
+        queue = BUS.subscribe()
+        try:
+            # 先发送历史事件（如果客户端提供了 since 时间戳）
+            for event in BUS.get_history(since if since else None):
+                yield f"event: {event['event']}\ndata: {_json.dumps(event['data'], ensure_ascii=False, default=str)}\n\n"
+
+            # 持续推送新事件
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=30.0)
+                    yield f"event: {event['event']}\ndata: {_json.dumps(event['data'], ensure_ascii=False, default=str)}\n\n"
+                except asyncio.TimeoutError:
+                    # 每 30 秒发一个注释行保活
+                    yield ":keepalive\n\n"
+        except asyncio.CancelledError:
+            pass
+        finally:
+            BUS.unsubscribe(queue)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # nginx 禁用缓冲
+        },
+    )
+
+
+@app.get("/api/metrics")
+def prometheus_metrics() -> Any:
+    """Prometheus 指标端点。
+
+    返回 text/plain 格式的指标数据，可被 Prometheus server 抓取。
+    无需鉴权（抓取时 Prometheus 通常不带自定义 header）。
+    """
+    from fastapi.responses import PlainTextResponse
+    return PlainTextResponse(content=REGISTRY.generate(), media_type="text/plain; charset=utf-8")
+
+
 @app.get("/api/healthz")
 def healthz() -> APIResponse:
     """健康检查端点：验证服务自身及关键依赖（数据库、对象存储）的状态。
@@ -210,21 +294,35 @@ def current_user() -> APIResponse:
 
 
 @app.get("/api/agents")
-def list_agents() -> APIResponse:
-    """返回所有 Agent 列表。调用前自动检查离线。"""
+def list_agents(
+    limit: int = 1000,
+    offset: int = 0,
+) -> APIResponse:
+    """返回 Agent 列表。支持分页。
+
+    调用前自动检查离线。可通过 ?limit=50&offset=0 分页。
+    """
     repo.mark_offline_agents()
-    items = []
+    all_items = []
     for agent in repo.agents.values():
         item = repo.as_dict(agent)
         item["latest_metrics"] = getattr(repo, "agent_metrics", {}).get(agent.id, {})
-        items.append(item)
-    return APIResponse(data=items)
+        all_items.append(item)
+    total = len(all_items)
+    page = all_items[offset:offset + limit] if offset < total else []
+    return APIResponse(data={"items": page, "total": total, "offset": offset, "limit": limit})
 
 
 @app.get("/api/audit-logs")
-def list_audit_logs() -> APIResponse:
-    items = [repo.as_dict(log) for log in repo.audit_logs]
-    return APIResponse(data=items)
+def list_audit_logs(
+    limit: int = 1000,
+    offset: int = 0,
+) -> APIResponse:
+    """返回审计日志列表。支持分页。"""
+    all_items = [repo.as_dict(log) for log in repo.audit_logs]
+    total = len(all_items)
+    page = all_items[offset:offset + limit] if offset < total else []
+    return APIResponse(data={"items": page, "total": total, "offset": offset, "limit": limit})
 
 
 # ── 任务 ──────────────────────────────────────────────────────
@@ -248,9 +346,18 @@ def create_task(payload: CreateTaskRequest) -> APIResponse:
 
 
 @app.get("/api/tasks")
-def list_tasks() -> APIResponse:
-    items = [_task_view(t).model_dump() for t in repo.tasks.values()]
-    return APIResponse(data={"items": items, "total": len(items)})
+def list_tasks(
+    limit: int = 1000,
+    offset: int = 0,
+) -> APIResponse:
+    """返回任务列表。支持分页。
+
+    可通过 ?limit=50&offset=0 分页。
+    """
+    all_items = [_task_view(t).model_dump() for t in repo.tasks.values()]
+    total = len(all_items)
+    page = all_items[offset:offset + limit] if offset < total else []
+    return APIResponse(data={"items": page, "total": total, "offset": offset, "limit": limit})
 
 
 @app.get("/api/tasks/{task_id}")
@@ -376,13 +483,16 @@ def diagnose_task(task_id: str) -> APIResponse:
             status=outcome.repair_plan.status,
         )
 
+    diag_status = "DONE" if report.validated else "FAILED"
     repo.finish_diagnosis_run(
         diagnosis_id=diagnosis_id,
-        status="DONE" if report.validated else "FAILED",
+        status=diag_status,
         summary=report.report.summary,
         validated=report.validated,
         retry_count=report.retry_count,
     )
+
+    notify_diagnosis_complete(task_id, diagnosis_id, diag_status)
 
     return APIResponse(data={
         "diagnosis_id": diagnosis_id,
