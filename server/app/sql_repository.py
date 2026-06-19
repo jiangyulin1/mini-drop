@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import threading
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime, timedelta
 from typing import Any
@@ -50,6 +51,37 @@ class SqlRepository:
         self._task_queues: dict[str, deque[str]] = {}
         self.agent_metrics: dict[str, dict[str, Any]] = {}
 
+    @contextmanager
+    def _write_session(self):
+        """写事务 context manager：加锁 → 建 session → 提交/回滚 → 关闭。
+
+        用于 register_agent / create_task / transition_task 等写操作。
+        自动处理 lock → new_session → commit → close 的重复模板。
+        """
+        with self._lock:
+            session = new_session()
+            try:
+                yield session
+                session.commit()
+            except Exception:
+                session.rollback()
+                raise
+            finally:
+                session.close()
+
+    @contextmanager
+    def _read_session(self):
+        """只读 session context manager：建 session → 查询 → 关闭。
+
+        用于 agents / tasks / events / artifacts 等只读查询。
+        不加锁，不提交事务。
+        """
+        session = new_session()
+        try:
+            yield session
+        finally:
+            session.close()
+
     # ------------------------------------------------------------------
     # Agent
     # ------------------------------------------------------------------
@@ -62,127 +94,96 @@ class SqlRepository:
         caps = list(capabilities or [])
         ts = now_utc()
 
-        with self._lock:
-            session = new_session()
-            try:
-                existing = session.get(AgentModel, agent_id)
-                if existing is not None and existing.status == "OFFLINE":
-                    self._write_audit(
-                        session, "AGENT_ONLINE", agent_id,
-                        f"{agent_id} 恢复在线",
-                    )
+        with self._write_session() as session:
+            existing = session.get(AgentModel, agent_id)
+            if existing is not None and existing.status == "OFFLINE":
+                self._write_audit(
+                    session, "AGENT_ONLINE", agent_id,
+                    f"{agent_id} 恢复在线",
+                )
 
-                if existing is not None:
-                    existing.hostname = hostname
-                    existing.ip_addr = ip_addr
-                    existing.version = version
-                    existing.os_info = os_info
-                    existing.capabilities = caps
-                    existing.status = "ONLINE"
-                    existing.last_heartbeat_at = ts
-                    existing.updated_at = ts
-                    agent = existing
-                else:
-                    agent = AgentModel(
-                        id=agent_id, hostname=hostname, ip_addr=ip_addr,
-                        version=version, os_info=os_info, capabilities=caps,
-                        status="ONLINE", last_heartbeat_at=ts,
-                        created_at=ts, updated_at=ts,
-                    )
-                    session.add(agent)
+            if existing is not None:
+                existing.hostname = hostname
+                existing.ip_addr = ip_addr
+                existing.version = version
+                existing.os_info = os_info
+                existing.capabilities = caps
+                existing.status = "ONLINE"
+                existing.last_heartbeat_at = ts
+                existing.updated_at = ts
+                agent = existing
+            else:
+                agent = AgentModel(
+                    id=agent_id, hostname=hostname, ip_addr=ip_addr,
+                    version=version, os_info=os_info, capabilities=caps,
+                    status="ONLINE", last_heartbeat_at=ts,
+                    created_at=ts, updated_at=ts,
+                )
+                session.add(agent)
 
-                if ip_addr not in self._task_queues:
-                    self._task_queues[ip_addr] = deque()
+            if ip_addr not in self._task_queues:
+                self._task_queues[ip_addr] = deque()
 
-                session.commit()
-                return agent
-            except Exception:
-                session.rollback()
-                raise
-            finally:
-                session.close()
+            return agent
 
     def heartbeat(self, agent_id: str, ip_addr: str) -> TaskModel | None:
-        with self._lock:
-            session = new_session()
-            try:
-                agent = session.get(AgentModel, agent_id)
-                if agent is None:
-                    return None
+        with self._write_session() as session:
+            agent = session.get(AgentModel, agent_id)
+            if agent is None:
+                return None
 
-                agent.status = "ONLINE"
-                agent.last_heartbeat_at = now_utc()
-                agent.updated_at = now_utc()
+            agent.status = "ONLINE"
+            agent.last_heartbeat_at = now_utc()
+            agent.updated_at = now_utc()
 
-                task = (
-                    session.query(TaskModel)
-                    .filter(
-                        TaskModel.agent_id == agent_id,
-                        TaskModel.status == TaskStatus.PENDING.value,
-                    )
-                    .order_by(TaskModel.created_at.asc())
-                    .first()
+            task = (
+                session.query(TaskModel)
+                .filter(
+                    TaskModel.agent_id == agent_id,
+                    TaskModel.status == TaskStatus.PENDING.value,
                 )
-                if task is None:
-                    session.commit()
-                    return None
+                .order_by(TaskModel.created_at.asc())
+                .first()
+            )
+            if task is None:
+                return None
 
-                self._transition_task_in_session(
-                    session, task.id, TaskStatus.RUNNING,
-                    "Agent 心跳拉取待执行任务", Actor.SERVER,
-                )
-                session.commit()
-                task.status = TaskStatus.RUNNING.value
-                return task
-            except Exception:
-                session.rollback()
-                raise
-            finally:
-                session.close()
+            self._transition_task_in_session(
+                session, task.id, TaskStatus.RUNNING,
+                "Agent 心跳拉取待执行任务", Actor.SERVER,
+            )
+            task.status = TaskStatus.RUNNING.value
+            return task
 
     def mark_offline_agents(self, timeout_sec: int = 30) -> list[AgentModel]:
-        with self._lock:
-            session = new_session()
-            try:
-                cutoff = now_utc() - timedelta(seconds=timeout_sec)
-                changed = (
-                    session.query(AgentModel)
-                    .filter(
-                        AgentModel.status == "ONLINE",
-                        AgentModel.last_heartbeat_at < cutoff,
-                    )
-                    .all()
+        with self._write_session() as session:
+            cutoff = now_utc() - timedelta(seconds=timeout_sec)
+            changed = (
+                session.query(AgentModel)
+                .filter(
+                    AgentModel.status == "ONLINE",
+                    AgentModel.last_heartbeat_at < cutoff,
                 )
-                for agent in changed:
-                    agent.status = "OFFLINE"
-                    agent.updated_at = now_utc()
-                    self._write_audit(
-                        session, "AGENT_OFFLINE", agent.id,
-                        f"{agent.id} 心跳超时 {timeout_sec}s，标记为离线",
-                    )
-                session.commit()
-                return changed
-            except Exception:
-                session.rollback()
-                raise
-            finally:
-                session.close()
+                .all()
+            )
+            for agent in changed:
+                agent.status = "OFFLINE"
+                agent.updated_at = now_utc()
+                self._write_audit(
+                    session, "AGENT_OFFLINE", agent.id,
+                    f"{agent.id} 心跳超时 {timeout_sec}s，标记为离线",
+                )
+            return changed
 
     @property
     def agents(self) -> dict[str, AgentModel]:
         """返回 {agent_id: AgentModel} 字典（兼容旧接口的 dict 访问）。"""
-        session = new_session()
-        try:
+        with self._read_session() as session:
             return {a.id: a for a in session.query(AgentModel).all()}
-        finally:
-            session.close()
 
     def find_agent_by_ip(self, ip_addr: str) -> AgentModel | None:
-        session = new_session()
-        try:
+        with self._read_session() as session:
             return session.query(AgentModel).filter(AgentModel.ip_addr == ip_addr).first()
-        finally:
-            session.close()
 
     def record_agent_metrics(self, agent_id: str, metrics: dict[str, Any]) -> None:
         with self._lock:
@@ -193,94 +194,71 @@ class SqlRepository:
     # ------------------------------------------------------------------
 
     def create_task(self, payload: CreateTaskRequest) -> TaskModel:
-        with self._lock:
-            session = new_session()
-            try:
-                ts = now_utc()
-                hex_suffix = uuid4().hex[:6]
-                task_id = f"task_{ts.strftime('%Y%m%d_%H%M%S')}_{hex_suffix}"
-                agent = session.get(AgentModel, payload.agent_id)
-                if agent is None:
-                    raise ValueError(f"Agent {payload.agent_id} 不存在")
+        with self._write_session() as session:
+            ts = now_utc()
+            hex_suffix = uuid4().hex[:6]
+            task_id = f"task_{ts.strftime('%Y%m%d_%H%M%S')}_{hex_suffix}"
+            agent = session.get(AgentModel, payload.agent_id)
+            if agent is None:
+                raise ValueError(f"Agent {payload.agent_id} 不存在")
 
-                task = TaskModel(
-                    id=task_id,
-                    name=payload.name,
-                    agent_id=payload.agent_id,
-                    target_pid=payload.target_pid,
-                    collector_type=payload.collector_type,
-                    sample_rate=payload.sample_rate,
-                    duration_sec=payload.duration_sec,
-                    status=TaskStatus.PENDING.value,
-                    status_reason="Web 请求创建任务",
-                    request_params=payload.model_dump(),
-                    created_at=ts,
-                )
-                session.add(task)
-                session.flush()
+            task = TaskModel(
+                id=task_id,
+                name=payload.name,
+                agent_id=payload.agent_id,
+                target_pid=payload.target_pid,
+                collector_type=payload.collector_type,
+                sample_rate=payload.sample_rate,
+                duration_sec=payload.duration_sec,
+                status=TaskStatus.PENDING.value,
+                status_reason="Web 请求创建任务",
+                request_params=payload.model_dump(),
+                created_at=ts,
+            )
+            session.add(task)
+            session.flush()
 
-                # 状态事件
-                self._write_event(session, task_id, None, TaskStatus.PENDING,
-                                  "Web 请求创建任务", Actor.WEB, payload.model_dump())
+            # 状态事件
+            self._write_event(session, task_id, None, TaskStatus.PENDING,
+                              "Web 请求创建任务", Actor.WEB, payload.model_dump())
 
-                # 审计日志
-                self._write_audit(session, "TASK_CREATED", task_id=task_id,
-                                  message=f"任务 {task_id} 已创建",
-                                  metadata=payload.model_dump())
+            # 审计日志
+            self._write_audit(session, "TASK_CREATED", task_id=task_id,
+                              message=f"任务 {task_id} 已创建",
+                              metadata=payload.model_dump())
 
-                session.commit()
-                return task
-            except Exception:
-                session.rollback()
-                raise
-            finally:
-                session.close()
+            return task
 
     def transition_task(
         self, task_id: str, to_status: TaskStatus,
         reason: str, actor: Actor,
         metadata: dict[str, Any] | None = None,
     ) -> TaskModel:
-        with self._lock:
-            session = new_session()
-            try:
-                task = session.get(TaskModel, task_id)
-                if task is None:
-                    raise ValueError(f"任务 {task_id} 不存在")
+        with self._write_session() as session:
+            task = session.get(TaskModel, task_id)
+            if task is None:
+                raise ValueError(f"任务 {task_id} 不存在")
 
-                _ = build_status_event(
-                    task_id, TaskStatus(task.status), to_status,
-                    reason, actor, metadata or {},
-                )
+            _ = build_status_event(
+                task_id, TaskStatus(task.status), to_status,
+                reason, actor, metadata or {},
+            )
 
-                self._transition_task_in_session(
-                    session, task_id, to_status, reason, actor, metadata,
-                )
-                session.commit()
-                task.status = to_status.value
-                return task
-            except ValueError:
-                session.rollback()
-                raise
-            except Exception:
-                session.rollback()
-                raise
-            finally:
-                session.close()
+            self._transition_task_in_session(
+                session, task_id, to_status, reason, actor, metadata,
+            )
+            task.status = to_status.value
+            return task
 
     @property
     def tasks(self) -> dict[str, TaskModel]:
-        session = new_session()
-        try:
+        with self._read_session() as session:
             return {t.id: t for t in session.query(TaskModel).all()}
-        finally:
-            session.close()
 
     @property
     def events(self) -> list[StatusEvent]:
         """返回所有状态事件，兼容原有 list[StatusEvent] 接口。"""
-        session = new_session()
-        try:
+        with self._read_session() as session:
             models = session.query(StatusEventModel).all()
             result: list[StatusEvent] = []
             for m in models:
@@ -294,49 +272,36 @@ class SqlRepository:
                     created_at=m.created_at if m.created_at else now_utc(),
                 ))
             return result
-        finally:
-            session.close()
 
     # ------------------------------------------------------------------
     # Artifacts
     # ------------------------------------------------------------------
 
     def add_artifacts(self, task_id: str, artifacts: list[dict[str, Any]]) -> None:
-        with self._lock:
-            session = new_session()
-            try:
-                ts = now_utc()
-                for art in artifacts:
-                    session.add(ArtifactModel(
-                        task_id=task_id,
-                        artifact_type=art.get("artifact_type", "raw"),
-                        bucket=art.get("bucket", "mini-drop"),
-                        object_key=art.get("object_key", ""),
-                        filename=art.get("filename"),
-                        local_path=art.get("local_path"),
-                        content_type=art.get("content_type", "application/octet-stream"),
-                        size_bytes=art.get("size_bytes", 0),
-                        meta_json=art.get("metadata", {}),
-                        created_at=ts,
-                    ))
-                session.commit()
-            except Exception:
-                session.rollback()
-                raise
-            finally:
-                session.close()
+        with self._write_session() as session:
+            ts = now_utc()
+            for art in artifacts:
+                session.add(ArtifactModel(
+                    task_id=task_id,
+                    artifact_type=art.get("artifact_type", "raw"),
+                    bucket=art.get("bucket", "mini-drop"),
+                    object_key=art.get("object_key", ""),
+                    filename=art.get("filename"),
+                    local_path=art.get("local_path"),
+                    content_type=art.get("content_type", "application/octet-stream"),
+                    size_bytes=art.get("size_bytes", 0),
+                    meta_json=art.get("metadata", {}),
+                    created_at=ts,
+                ))
 
     @property
     def artifacts(self) -> dict[str, list[dict[str, Any]]]:
-        session = new_session()
-        try:
+        with self._read_session() as session:
             result: dict[str, list[dict[str, Any]]] = {}
             for art in session.query(ArtifactModel).all():
                 tid = art.task_id if art.task_id else ""
                 result.setdefault(tid, []).append(art.to_dict())
             return result
-        finally:
-            session.close()
 
     # ------------------------------------------------------------------
     # Audit
@@ -358,109 +323,74 @@ class SqlRepository:
 
     @property
     def audit_logs(self) -> list[AuditLogModel]:
-        session = new_session()
-        try:
+        with self._read_session() as session:
             return session.query(AuditLogModel).all()
-        finally:
-            session.close()
 
     # ------------------------------------------------------------------
     # RCA
     # ------------------------------------------------------------------
 
     def create_diagnosis_run(self, task_id: str, model_name: str) -> str:
-        with self._lock:
-            session = new_session()
-            try:
-                ts = now_utc()
-                diagnosis_id = f"diag_{ts.strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:6]}"
-                session.add(DiagnosisRunModel(
-                    id=diagnosis_id,
-                    task_id=task_id,
-                    status="RUNNING",
-                    model_name=model_name,
-                    created_at=ts,
-                ))
-                session.commit()
-                return diagnosis_id
-            except Exception:
-                session.rollback()
-                raise
-            finally:
-                session.close()
+        with self._write_session() as session:
+            ts = now_utc()
+            diagnosis_id = f"diag_{ts.strftime('%Y%m%d_%H%M%S')}_{uuid4().hex[:6]}"
+            session.add(DiagnosisRunModel(
+                id=diagnosis_id,
+                task_id=task_id,
+                status="RUNNING",
+                model_name=model_name,
+                created_at=ts,
+            ))
+            return diagnosis_id
 
     def finish_diagnosis_run(
         self, diagnosis_id: str, status: str, summary: str,
         validated: bool, retry_count: int,
     ) -> None:
-        with self._lock:
-            session = new_session()
-            try:
-                run = session.get(DiagnosisRunModel, diagnosis_id)
-                if run is None:
-                    raise ValueError(f"诊断 {diagnosis_id} 不存在")
-                run.status = status
-                run.summary = summary
-                run.validated = 1 if validated else 0
-                run.retry_count = retry_count
-                run.finished_at = now_utc()
-                session.commit()
-            except Exception:
-                session.rollback()
-                raise
-            finally:
-                session.close()
+        with self._write_session() as session:
+            run = session.get(DiagnosisRunModel, diagnosis_id)
+            if run is None:
+                raise ValueError(f"诊断 {diagnosis_id} 不存在")
+            run.status = status
+            run.summary = summary
+            run.validated = 1 if validated else 0
+            run.retry_count = retry_count
+            run.finished_at = now_utc()
 
     def add_diagnosis_tool_result(
         self, diagnosis_id: str, tool_name: str, status: str,
         evidence_ref: str, input_json: dict[str, Any],
         output_json: dict[str, Any], error_message: str | None = None,
     ) -> None:
-        with self._lock:
-            session = new_session()
-            try:
-                session.add(DiagnosisToolResultModel(
-                    diagnosis_id=diagnosis_id,
-                    tool_name=tool_name,
-                    status=status,
-                    evidence_ref=evidence_ref,
-                    input_json=_json_safe(input_json),
-                    output_json=_json_safe(output_json),
-                    error_message=error_message,
-                    created_at=now_utc(),
-                ))
-                session.commit()
-            except Exception:
-                session.rollback()
-                raise
-            finally:
-                session.close()
+        with self._write_session() as session:
+            session.add(DiagnosisToolResultModel(
+                diagnosis_id=diagnosis_id,
+                tool_name=tool_name,
+                status=status,
+                evidence_ref=evidence_ref,
+                input_json=_json_safe(input_json),
+                output_json=_json_safe(output_json),
+                error_message=error_message,
+                created_at=now_utc(),
+            ))
 
     def add_diagnosis_report(
         self, diagnosis_id: str, report_json: dict[str, Any],
         ranked_causes: list[dict[str, Any]], confidence: float,
         not_enough_evidence: bool,
     ) -> str:
-        with self._lock:
-            session = new_session()
-            try:
-                report_id = f"report_{uuid4().hex[:10]}"
-                session.add(DiagnosisReportModel(
-                    id=report_id,
-                    diagnosis_id=diagnosis_id,
-                    report_json=_json_safe(report_json),
-                    ranked_causes_json=_json_safe(ranked_causes),
-                    confidence=int(max(0.0, min(confidence, 1.0)) * 1000),
-                    not_enough_evidence=1 if not_enough_evidence else 0,
-                    created_at=now_utc(),
-                ))
-                session.commit()
-                return report_id
-            except Exception:
-                session.rollback()
-                raise
-            finally:
-                session.close()
+        with self._write_session() as session:
+            report_id = f"report_{uuid4().hex[:10]}"
+            session.add(DiagnosisReportModel(
+                id=report_id,
+                diagnosis_id=diagnosis_id,
+                report_json=_json_safe(report_json),
+                ranked_causes_json=_json_safe(ranked_causes),
+                confidence=int(max(0.0, min(confidence, 1.0)) * 1000),
+                not_enough_evidence=1 if not_enough_evidence else 0,
+                created_at=now_utc(),
+            ))
+            return report_id
 
     def add_repair_plan(
         self, diagnosis_id: str, plan_id: str, cause_id: str,
@@ -468,30 +398,21 @@ class SqlRepository:
         executed_actions: list[dict[str, Any]],
         requires_user_confirm: bool, status: str,
     ) -> None:
-        with self._lock:
-            session = new_session()
-            try:
-                session.add(RepairPlanModel(
-                    id=plan_id,
-                    diagnosis_id=diagnosis_id,
-                    cause_id=cause_id,
-                    risk_level=risk_level,
-                    actions_json=_json_safe(actions),
-                    executed_actions_json=_json_safe(executed_actions),
-                    requires_user_confirm=1 if requires_user_confirm else 0,
-                    status=status,
-                    created_at=now_utc(),
-                ))
-                session.commit()
-            except Exception:
-                session.rollback()
-                raise
-            finally:
-                session.close()
+        with self._write_session() as session:
+            session.add(RepairPlanModel(
+                id=plan_id,
+                diagnosis_id=diagnosis_id,
+                cause_id=cause_id,
+                risk_level=risk_level,
+                actions_json=_json_safe(actions),
+                executed_actions_json=_json_safe(executed_actions),
+                requires_user_confirm=1 if requires_user_confirm else 0,
+                status=status,
+                created_at=now_utc(),
+            ))
 
     def get_diagnosis(self, diagnosis_id: str) -> dict[str, Any] | None:
-        session = new_session()
-        try:
+        with self._read_session() as session:
             run = session.get(DiagnosisRunModel, diagnosis_id)
             if run is None:
                 return None
@@ -519,12 +440,9 @@ class SqlRepository:
                 "repair_plan": plan.to_dict() if plan else None,
                 "tool_results": [tool.to_dict() for tool in tools],
             }
-        finally:
-            session.close()
 
     def list_diagnoses_for_task(self, task_id: str) -> list[dict[str, Any]]:
-        session = new_session()
-        try:
+        with self._read_session() as session:
             runs = (
                 session.query(DiagnosisRunModel)
                 .filter(DiagnosisRunModel.task_id == task_id)
@@ -532,12 +450,9 @@ class SqlRepository:
                 .all()
             )
             return [run.to_dict() for run in runs]
-        finally:
-            session.close()
 
     def get_feedback_priors(self) -> dict[str, FeedbackPrior]:
-        session = new_session()
-        try:
+        with self._read_session() as session:
             priors: dict[str, FeedbackPrior] = {}
             for row in session.query(RCAFeedbackWeightModel).all():
                 priors[row.candidate_id] = FeedbackPrior(
@@ -547,58 +462,48 @@ class SqlRepository:
                     weight_delta=(row.weight_delta or 0) / 1000,
                 )
             return priors
-        finally:
-            session.close()
 
     def record_rca_feedback(
         self, diagnosis_id: str, task_id: str, predicted_cause_id: str,
         feedback_label: str, corrected_cause_id: str | None = None,
         feedback_note: str | None = None,
     ) -> None:
-        with self._lock:
-            session = new_session()
-            try:
-                ts = now_utc()
-                session.add(RCAFeedbackModel(
-                    diagnosis_id=diagnosis_id,
-                    task_id=task_id,
-                    predicted_cause_id=predicted_cause_id,
-                    feedback_label=feedback_label,
-                    corrected_cause_id=corrected_cause_id,
-                    feedback_note=feedback_note,
-                    created_at=ts,
-                ))
+        with self._write_session() as session:
+            ts = now_utc()
+            session.add(RCAFeedbackModel(
+                diagnosis_id=diagnosis_id,
+                task_id=task_id,
+                predicted_cause_id=predicted_cause_id,
+                feedback_label=feedback_label,
+                corrected_cause_id=corrected_cause_id,
+                feedback_note=feedback_note,
+                created_at=ts,
+            ))
 
-                candidate_id = corrected_cause_id if feedback_label == "wrong" and corrected_cause_id else predicted_cause_id
-                weight = session.get(RCAFeedbackWeightModel, candidate_id)
-                if weight is None:
-                    weight = RCAFeedbackWeightModel(
-                        candidate_id=candidate_id,
-                        positive_count=0,
-                        negative_count=0,
-                        partial_count=0,
-                        weight_delta=0,
-                        updated_at=ts,
-                    )
-                    session.add(weight)
-
-                if feedback_label == "correct":
-                    weight.positive_count += 1
-                elif feedback_label == "partial":
-                    weight.partial_count += 1
-                elif feedback_label == "wrong":
-                    weight.negative_count += 1
-
-                weight.weight_delta = _feedback_delta(
-                    weight.positive_count, weight.partial_count, weight.negative_count,
+            candidate_id = corrected_cause_id if feedback_label == "wrong" and corrected_cause_id else predicted_cause_id
+            weight = session.get(RCAFeedbackWeightModel, candidate_id)
+            if weight is None:
+                weight = RCAFeedbackWeightModel(
+                    candidate_id=candidate_id,
+                    positive_count=0,
+                    negative_count=0,
+                    partial_count=0,
+                    weight_delta=0,
+                    updated_at=ts,
                 )
-                weight.updated_at = ts
-                session.commit()
-            except Exception:
-                session.rollback()
-                raise
-            finally:
-                session.close()
+                session.add(weight)
+
+            if feedback_label == "correct":
+                weight.positive_count += 1
+            elif feedback_label == "partial":
+                weight.partial_count += 1
+            elif feedback_label == "wrong":
+                weight.negative_count += 1
+
+            weight.weight_delta = _feedback_delta(
+                weight.positive_count, weight.partial_count, weight.negative_count,
+            )
+            weight.updated_at = ts
 
     # ------------------------------------------------------------------
     # 内部辅助
