@@ -6,6 +6,15 @@ import Dashboard from "./pages/Dashboard";
 
 const AuditLogs = lazy(() => import("./pages/AuditLogs"));
 const TaskResult = lazy(() => import("./pages/TaskResult"));
+const DiagnosisHistory = lazy(() => import("./pages/DiagnosisHistory"));
+const AgentDetail = lazy(() => import("./pages/AgentDetail"));
+const Settings = lazy(() => import("./pages/Settings"));
+
+const Lazy = ({ children }) => (
+  <Suspense fallback={<Spin size="large" style={{ display: "block", margin: "40px auto" }} />}>
+    {children}
+  </Suspense>
+);
 
 export default function Router() {
   return (
@@ -15,19 +24,23 @@ export default function Router() {
           <Route path="/" element={<Dashboard />} />
           <Route
             path="/audit"
-            element={(
-              <Suspense fallback={<Spin />}>
-                <AuditLogs />
-              </Suspense>
-            )}
+            element={<Lazy><AuditLogs /></Lazy>}
           />
           <Route
             path="/task/:taskId"
-            element={(
-              <Suspense fallback={<Spin />}>
-                <TaskResult />
-              </Suspense>
-            )}
+            element={<Lazy><TaskResult /></Lazy>}
+          />
+          <Route
+            path="/diagnoses"
+            element={<Lazy><DiagnosisHistory /></Lazy>}
+          />
+          <Route
+            path="/agent/:agentId"
+            element={<Lazy><AgentDetail /></Lazy>}
+          />
+          <Route
+            path="/settings"
+            element={<Lazy><Settings /></Lazy>}
           />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Route>

@@ -1,14 +1,15 @@
-import { useEffect, useState, useMemo } from "react";
+import { useEffect, useState, useMemo, useCallback } from "react";
 import {
   Alert,
   Badge,
   Button,
   Card,
   Col,
+  notification,
   Row,
   Skeleton,
   Space,
-  Spin,
+  Statistic,
   Table,
   Tag,
   Typography,
@@ -22,66 +23,157 @@ import {
   CloseCircleOutlined,
   SyncOutlined,
   ClockCircleOutlined,
+  ExperimentOutlined,
+  BellOutlined,
+  ThunderboltOutlined,
+  HddOutlined,
 } from "@ant-design/icons";
-import { Link } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import { healthz, listAgents, listTasks } from "../api/client";
 import NLPTaskInput from "../components/NLPTaskInput";
 import StatusTag from "../components/StatusTag";
 import ErrorAlert from "../components/ErrorAlert";
 import usePolling from "../hooks/usePolling";
-import { COLORS, SPACING } from "../theme";
+import useSSE from "../hooks/useSSE";
+import { COLORS, FONT_SIZES, SPACING } from "../theme";
+
+// ── 通知列表（最近 5 条 toast 通知）──────────────────────
+
+const RECENT_KEYS = new Set();
+const MAX_NOTIFICATIONS = 5;
+
+function showEventNotification(eventType, data) {
+  const key = `${eventType}-${data.task_id || data.agent_id || Date.now()}`;
+  if (RECENT_KEYS.has(key)) return;
+  RECENT_KEYS.add(key);
+  if (RECENT_KEYS.size > MAX_NOTIFICATIONS) {
+    const first = RECENT_KEYS.values().next().value;
+    RECENT_KEYS.delete(first);
+  }
+
+  const messages = {
+    task_changed: {
+      title: `任务 ${data.task_id?.slice(0, 8)}…`,
+      description: `${data.from_status || "?"} → ${data.to_status}`,
+      icon: data.to_status === "DONE" ? <CheckCircleOutlined style={{ color: COLORS.success }} />
+        : data.to_status === "FAILED" ? <CloseCircleOutlined style={{ color: COLORS.error }} />
+        : <SyncOutlined spin style={{ color: COLORS.primary }} />,
+    },
+    agent_status: {
+      title: `Agent ${data.agent_id}`,
+      description: data.status === "ONLINE" ? "已上线" : "已离线",
+      icon: data.status === "ONLINE"
+        ? <CloudServerOutlined style={{ color: COLORS.success }} />
+        : <CloudServerOutlined style={{ color: COLORS.error }} />,
+    },
+    diagnosis_complete: {
+      title: `诊断 ${data.diagnosis_id?.slice(0, 8)}…`,
+      description: data.status === "DONE" ? "诊断完成" : "诊断失败",
+      icon: <ExperimentOutlined style={{ color: data.status === "DONE" ? COLORS.success : COLORS.error }} />,
+    },
+  };
+
+  const cfg = messages[eventType];
+  if (!cfg) return;
+
+  notification.open({
+    key,
+    message: cfg.title,
+    description: cfg.description,
+    icon: cfg.icon,
+    placement: "bottomRight",
+    duration: 4,
+    style: { borderRadius: 8 },
+  });
+}
+
+// ── 组件 ──────────────────────────────────────────────────
 
 export default function Dashboard() {
+  const navigate = useNavigate();
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [service, setService] = useState(null);
   const [tasks, setTasks] = useState([]);
   const [agents, setAgents] = useState([]);
 
-  async function refresh() {
+  // ── 数据加载 ──────────────────────────────────────────
+
+  const refresh = useCallback(async () => {
     setError("");
     try {
-      const [health, taskResp, agentResp] = await Promise.all([
+      const [healthRes, taskRes, agentRes] = await Promise.allSettled([
         healthz(),
         listTasks(),
         listAgents(),
       ]);
-      setService(health);
-      setTasks(taskResp.items || []);
-      setAgents(agentResp || []);
+      if (healthRes.status === "fulfilled") setService(healthRes.value);
+      setTasks(taskRes.status === "fulfilled" ? taskRes.value || [] : []);
+      setAgents(agentRes.status === "fulfilled" ? agentRes.value || [] : []);
     } catch (err) {
       setError(err.message);
     } finally {
       setLoading(false);
     }
-  }
+  }, []);
 
   useEffect(() => {
     refresh();
-  }, []);
+  }, [refresh]);
 
-  // 每 10 秒自动刷新
+  // 每 10 秒自动轮询（SSE 断线时兜底）
   const { isPolling } = usePolling(refresh, { interval: 10000, enabled: !loading });
+
+  // ── SSE 实时事件 ──────────────────────────────────────
+
+  useSSE({
+    onTaskChanged(data) {
+      showEventNotification("task_changed", data);
+      refresh(); // 事件到达后刷新数据
+    },
+    onAgentStatus(data) {
+      showEventNotification("agent_status", data);
+      refresh();
+    },
+    onDiagnosisComplete(data) {
+      showEventNotification("diagnosis_complete", data);
+      refresh();
+    },
+  });
 
   // ── 统计 ──────────────────────────────────────────────
 
   const stats = useMemo(() => {
     const doneCount = tasks.filter((t) => t.status === "DONE").length;
     const failedCount = tasks.filter((t) => t.status === "FAILED").length;
-    const activeCount = tasks.filter(
-      (t) =>
-        t.status === "RUNNING" ||
-        t.status === "ANALYZING" ||
-        t.status === "UPLOADING" ||
-        t.status === "PENDING"
+    const activeCount = tasks.filter((t) =>
+      ["PENDING", "RUNNING", "UPLOADING", "ANALYZING"].includes(t.status)
     ).length;
     const onlineCount = agents.filter((a) => a.status === "ONLINE").length;
     const offlineCount = agents.filter((a) => a.status === "OFFLINE").length;
+    const successRate = tasks.length > 0
+      ? Math.round((doneCount / (doneCount + failedCount || 1)) * 100)
+      : 100;
 
-    return { doneCount, failedCount, activeCount, onlineCount, offlineCount, total: tasks.length };
+    return {
+      total: tasks.length,
+      doneCount,
+      failedCount,
+      activeCount,
+      onlineCount,
+      offlineCount,
+      successRate,
+    };
   }, [tasks, agents]);
 
-  // ── 表格列定义 ────────────────────────────────────────
+  // ── 最近成功任务 ──────────────────────────────────────
+
+  const recentDone = useMemo(
+    () => tasks.filter((t) => t.status === "DONE").slice(0, 3),
+    [tasks]
+  );
+
+  // ── 表格列 ────────────────────────────────────────────
 
   const taskColumns = useMemo(
     () => [
@@ -93,27 +185,80 @@ export default function Dashboard() {
           <Link to={`/task/${record.id}`}>{value || record.id}</Link>
         ),
       },
-      { title: "Agent", dataIndex: "agent_id", width: 140, ellipsis: true },
+      {
+        title: "Agent",
+        dataIndex: "agent_id",
+        width: 160,
+        ellipsis: true,
+        render: (value) => (
+          <Typography.Link
+            onClick={() => navigate(`/agent/${value}`)}
+            style={{ cursor: "pointer", fontSize: FONT_SIZES.sm }}
+          >
+            {value}
+          </Typography.Link>
+        ),
+      },
       { title: "PID", dataIndex: "target_pid", width: 80 },
-      { title: "采集器", dataIndex: "collector_type", width: 110 },
+      {
+        title: "采集器",
+        dataIndex: "collector_type",
+        width: 130,
+        render: (value) => {
+          const colors = {
+            perf_cpu: "blue",
+            ebpf_io: "green",
+            pyspy: "purple",
+            continuous_perf: "cyan",
+            java_async: "magenta",
+            go_pprof: "geekblue",
+            memory_smaps: "orange",
+            sys_metrics: "gold",
+          };
+          return (
+            <Tag color={colors[value] || "default"} style={{ fontSize: 11 }}>
+              {value}
+            </Tag>
+          );
+        },
+      },
       {
         title: "状态",
         dataIndex: "status",
         width: 110,
         render: (value) => <StatusTag status={value} />,
       },
+      {
+        title: "创建时间",
+        dataIndex: "created_at",
+        width: 170,
+        render: (v) => (v ? new Date(v).toLocaleString() : "-"),
+      },
     ],
-    []
+    [navigate]
   );
 
   const agentColumns = useMemo(
     () => [
-      { title: "Agent", dataIndex: "id", width: 140, ellipsis: true },
-      { title: "Host", dataIndex: "hostname", width: 120, ellipsis: true },
+      {
+        title: "Agent",
+        dataIndex: "id",
+        width: 180,
+        ellipsis: true,
+        render: (value) => (
+          <Typography.Link
+            onClick={() => navigate(`/agent/${value}`)}
+            style={{ cursor: "pointer", fontSize: FONT_SIZES.sm }}
+          >
+            {value}
+          </Typography.Link>
+        ),
+      },
+      { title: "Host", dataIndex: "hostname", width: 140, ellipsis: true },
       { title: "IP", dataIndex: "ip_addr", width: 140 },
       {
         title: "CPU",
-        width: 80,
+        width: 70,
         render: (_, record) =>
           `${record.latest_metrics?.self?.cpu_percent ?? 0}%`,
       },
@@ -121,14 +266,14 @@ export default function Dashboard() {
         title: "RSS",
         width: 90,
         render: (_, record) =>
-          `${record.latest_metrics?.self?.rss_mb ?? 0} MB`,
+          `${(record.latest_metrics?.self?.rss_mb ?? 0).toFixed(1)} MB`,
       },
       {
-        title: "IO",
-        width: 110,
+        title: "IO R/W",
+        width: 100,
         render: (_, record) => {
           const s = record.latest_metrics?.self || {};
-          return `${s.read_kb_s ?? 0}/${s.write_kb_s ?? 0} KB/s`;
+          return `${s.read_kb_s ?? 0}/${s.write_kb_s ?? 0}`;
         },
       },
       {
@@ -138,7 +283,7 @@ export default function Dashboard() {
         render: (value) => <StatusTag status={value} />,
       },
     ],
-    []
+    [navigate]
   );
 
   // ── 加载骨架屏 ────────────────────────────────────────
@@ -148,8 +293,8 @@ export default function Dashboard() {
       <Space direction="vertical" size={SPACING.lg} style={{ width: "100%" }}>
         <Skeleton.Input active size="small" style={{ width: 160 }} />
         <Row gutter={SPACING.lg}>
-          {[1, 2, 3].map((i) => (
-            <Col xs={24} md={8} key={i}>
+          {[1, 2, 3, 4].map((i) => (
+            <Col xs={12} md={6} key={i}>
               <Card size="small">
                 <Skeleton active paragraph={{ rows: 1 }} />
               </Card>
@@ -166,22 +311,28 @@ export default function Dashboard() {
     );
   }
 
-  // ── 渲染 ──────────────────────────────────────────────
-
   return (
     <Space direction="vertical" size={SPACING.lg} style={{ width: "100%" }}>
-      {/* 页头 */}
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
+      {/* ── 页头 ──────────────────────────────────────────── */}
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          flexWrap: "wrap",
+          gap: 8,
+        }}
+      >
         <Space align="center">
           <DashboardOutlined style={{ fontSize: 20, color: COLORS.primary }} />
           <Typography.Title level={4} style={{ margin: 0 }}>
             任务面板
           </Typography.Title>
         </Space>
-        <Space>
+        <Space size="small">
           {isPolling && (
             <Tag icon={<SyncOutlined spin />} color="processing">
-              每 10s 自动刷新
+              10s 自动刷新
             </Tag>
           )}
           <Button icon={<ReloadOutlined />} onClick={refresh}>
@@ -190,85 +341,202 @@ export default function Dashboard() {
         </Space>
       </div>
 
-      {/* NLP 输入 */}
-      <NLPTaskInput onTaskCreated={() => refresh()} />
+      {/* ── NLP 输入 ──────────────────────────────────────── */}
+      <NLPTaskInput onTaskCreated={(taskId) => { refresh(); }} />
 
       <ErrorAlert error={error} onClose={() => setError("")} />
 
-      {/* 统计卡片 */}
+      {/* ── 统计卡片组 ────────────────────────────────────── */}
+      <Row gutter={[SPACING.lg, SPACING.lg]}>
+        {/* 服务 */}
+        <Col xs={12} md={6}>
+          <Card
+            size="small"
+            bodyStyle={{ padding: "14px 18px" }}
+            style={{ borderLeft: `3px solid ${COLORS.primary}` }}
+          >
+            <Statistic
+              title={
+                <Space size={4}>
+                  <ApiOutlined style={{ color: COLORS.primary, fontSize: 14 }} />
+                  <Typography.Text style={{ fontSize: FONT_SIZES.sm, color: COLORS.textSecondary }}>
+                    服务版本
+                  </Typography.Text>
+                </Space>
+              }
+              value={service?.version || "0.1.0"}
+              valueStyle={{ fontSize: 22, color: COLORS.primary }}
+            />
+          </Card>
+        </Col>
+
+        {/* Agent 在线 */}
+        <Col xs={12} md={6}>
+          <Card
+            size="small"
+            bodyStyle={{ padding: "14px 18px" }}
+            style={{ borderLeft: `3px solid ${COLORS.success}` }}
+          >
+            <Statistic
+              title={
+                <Space size={4}>
+                  <CloudServerOutlined style={{ color: COLORS.success, fontSize: 14 }} />
+                  <Typography.Text style={{ fontSize: FONT_SIZES.sm, color: COLORS.textSecondary }}>
+                    Agent 在线
+                  </Typography.Text>
+                </Space>
+              }
+              value={stats.onlineCount}
+              suffix={
+                <Typography.Text style={{ fontSize: FONT_SIZES.sm, color: COLORS.textSecondary }}>
+                  / {stats.onlineCount + stats.offlineCount}
+                </Typography.Text>
+              }
+              valueStyle={{ fontSize: 28, color: stats.onlineCount > 0 ? COLORS.success : COLORS.offline }}
+            />
+          </Card>
+        </Col>
+
+        {/* 任务统计 */}
+        <Col xs={12} md={6}>
+          <Card
+            size="small"
+            bodyStyle={{ padding: "14px 18px" }}
+            style={{ borderLeft: `3px solid ${COLORS.warning}` }}
+          >
+            <Statistic
+              title={
+                <Space size={4}>
+                  <ThunderboltOutlined style={{ color: COLORS.warning, fontSize: 14 }} />
+                  <Typography.Text style={{ fontSize: FONT_SIZES.sm, color: COLORS.textSecondary }}>
+                    进行中
+                  </Typography.Text>
+                </Space>
+              }
+              value={stats.activeCount}
+              suffix={
+                <Typography.Text style={{ fontSize: FONT_SIZES.sm, color: COLORS.textSecondary }}>
+                  / {stats.total}
+                </Typography.Text>
+              }
+              valueStyle={{ fontSize: 28, color: stats.activeCount > 0 ? COLORS.warning : COLORS.textSecondary }}
+            />
+          </Card>
+        </Col>
+
+        {/* 成功率 */}
+        <Col xs={12} md={6}>
+          <Card
+            size="small"
+            bodyStyle={{ padding: "14px 18px" }}
+            style={{ borderLeft: `3px solid ${stats.successRate >= 80 ? COLORS.success : stats.successRate >= 50 ? COLORS.warning : COLORS.error}` }}
+          >
+            <Statistic
+              title={
+                <Space size={4}>
+                  <CheckCircleOutlined style={{ color: COLORS.success, fontSize: 14 }} />
+                  <Typography.Text style={{ fontSize: FONT_SIZES.sm, color: COLORS.textSecondary }}>
+                    成功率
+                  </Typography.Text>
+                </Space>
+              }
+              value={stats.successRate}
+              suffix="%"
+              valueStyle={{
+                fontSize: 28,
+                color: stats.successRate >= 80 ? COLORS.success : stats.successRate >= 50 ? COLORS.warning : COLORS.error,
+              }}
+            />
+          </Card>
+        </Col>
+      </Row>
+
+      {/* ── 子统计 ────────────────────────────────────────── */}
       <Row gutter={SPACING.lg}>
-        <Col xs={24} md={8}>
-          <Card size="small" style={{ background: COLORS.primaryBg }}>
-            <Space>
-              <ApiOutlined style={{ color: COLORS.primary }} />
-              <Typography.Text strong>{service?.service || "mini-drop-server"}</Typography.Text>
-              <Tag color="blue">{service?.version || "unknown"}</Tag>
+        <Col xs={24} md={12}>
+          <Card size="small" bodyStyle={{ padding: "12px 16px" }}>
+            <Space size={[8, 4]} wrap>
+              <Typography.Text style={{ fontSize: FONT_SIZES.sm, color: COLORS.textSecondary }}>
+                任务分布：
+              </Typography.Text>
+              <Tag icon={<CheckCircleOutlined />} color="green">
+                {stats.doneCount} 完成
+              </Tag>
+              <Tag icon={<CloseCircleOutlined />} color="red">
+                {stats.failedCount} 失败
+              </Tag>
+              <Tag icon={<SyncOutlined spin={stats.activeCount > 0} />} color="blue">
+                {stats.activeCount} 进行中
+              </Tag>
+              <Tag icon={<ClockCircleOutlined />} color="default">
+                {stats.total - stats.doneCount - stats.failedCount - stats.activeCount} 其他
+              </Tag>
             </Space>
           </Card>
         </Col>
-        <Col xs={24} md={8}>
-          <Card size="small">
-            <Space direction="vertical" style={{ width: "100%" }} size={4}>
-              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                <CloudServerOutlined /> 任务数
+        <Col xs={24} md={12}>
+          <Card size="small" bodyStyle={{ padding: "12px 16px" }}>
+            <Space size={[8, 4]} wrap>
+              <Typography.Text style={{ fontSize: FONT_SIZES.sm, color: COLORS.textSecondary }}>
+                Agent 状态：
               </Typography.Text>
-              <Typography.Title level={3} style={{ margin: 0, fontSize: 28 }}>
-                {stats.total}
-              </Typography.Title>
-              <Space size={[4, 4]} wrap>
-                <Tag icon={<CheckCircleOutlined />} color="green">
-                  {stats.doneCount} 完成
+              <Badge status="success" text={`${stats.onlineCount} 在线`} />
+              <Badge status="default" text={`${stats.offlineCount} 离线`} />
+              {recentDone.length > 0 && (
+                <Tag icon={<ExperimentOutlined />} color="purple">
+                  最近完成: {recentDone.map((t) => t.name || t.id?.slice(0, 6)).join(", ")}
                 </Tag>
-                <Tag icon={<CloseCircleOutlined />} color="red">
-                  {stats.failedCount} 失败
-                </Tag>
-                <Tag icon={<SyncOutlined spin={stats.activeCount > 0} />} color="blue">
-                  {stats.activeCount} 进行中
-                </Tag>
-              </Space>
-            </Space>
-          </Card>
-        </Col>
-        <Col xs={24} md={8}>
-          <Card size="small">
-            <Space direction="vertical" style={{ width: "100%" }} size={4}>
-              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                <CloudServerOutlined /> Agent 在线
-              </Typography.Text>
-              <Typography.Title level={3} style={{ margin: 0, fontSize: 28 }}>
-                {stats.onlineCount}
-              </Typography.Title>
-              <Space size={[4, 4]} wrap>
-                <Badge status="success" text={`${stats.onlineCount} 在线`} />
-                <Badge status="default" text={`${stats.offlineCount} 离线`} />
-              </Space>
+              )}
             </Space>
           </Card>
         </Col>
       </Row>
 
-      {/* 任务列表 */}
-      <Card title="任务列表" size="small">
+      {/* ── 任务列表 ──────────────────────────────────────── */}
+      <Card
+        title={
+          <Space>
+            <HddOutlined style={{ color: COLORS.primary }} />
+            任务列表
+            <Tag>{tasks.length}</Tag>
+          </Space>
+        }
+        size="small"
+        extra={
+          <Button size="small" type="link" onClick={() => navigate("/diagnoses")}>
+            <ExperimentOutlined /> 诊断历史
+          </Button>
+        }
+      >
         <Table
           rowKey="id"
           columns={taskColumns}
           dataSource={tasks}
-          pagination={{ pageSize: 8, showSizeChanger: false }}
+          pagination={{ pageSize: 8, showSizeChanger: true, showTotal: (t) => `共 ${t} 条` }}
           size="middle"
-          scroll={{ x: 600 }}
-          locale={{ emptyText: "暂无任务，使用上方 NLP 输入或 API 创建第一个任务" }}
+          scroll={{ x: 800 }}
+          locale={{ emptyText: "暂无任务，使用上方 NLP 输入或 API 创建第一个采集任务" }}
         />
       </Card>
 
-      {/* Agent 列表 */}
-      <Card title="Agent 列表" size="small">
+      {/* ── Agent 列表 ─────────────────────────────────────── */}
+      <Card
+        title={
+          <Space>
+            <CloudServerOutlined style={{ color: COLORS.success }} />
+            Agent 列表
+            <Tag>{agents.length}</Tag>
+          </Space>
+        }
+        size="small"
+      >
         <Table
           rowKey="id"
           columns={agentColumns}
           dataSource={agents}
           pagination={false}
           size="middle"
-          scroll={{ x: 700 }}
+          scroll={{ x: 800 }}
           locale={{ emptyText: "暂无 Agent 注册，请在目标主机上启动 Agent" }}
         />
       </Card>
