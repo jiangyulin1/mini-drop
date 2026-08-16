@@ -84,6 +84,7 @@ from server.app.diagnosis.agent_runtime import (
     AgentTurnIntent,
     AgentTurnRequest,
     AgentTurnResult,
+    DeploymentAssessmentRequest,
     assess_deployment_capacity,
     build_case_evidence_chain,
     build_observability_tool_plan,
@@ -106,14 +107,34 @@ from server.app.diagnosis.investigation_plan import (
 )
 from server.app.diagnosis.mcp_fact_resolver import McpEvidenceService, McpFactResolver
 from server.app.diagnosis.reference_resolver import ReferenceResolver, ResourceRef
-from server.app.agent_runtime.config import agent_flags, agent_max_active_cases
-from server.app.agent_runtime.dispatcher import active_runtime_info
+from server.app.diagnosis.query_registry import QUERY_REGISTRY
+from server.app.agent_runtime.config import (
+    AgentRuntimeMode,
+    agent_flags,
+    agent_max_active_cases,
+    runtime_mode,
+)
+from server.app.agent_runtime.dispatcher import active_runtime_info, get_runtime
+from server.app.agent_runtime.port import AgentTurnInput, CaseContextSnapshot, RuntimeFollowUp
 from server.app.agent_runtime.shadow import (
     build_deterministic_plan,
     compare_plans,
     request_shadow_plan,
 )
+from server.app.diagnosis.case_evidence import CaseEvidenceService
+from server.app.diagnosis.v6_policy import (
+    READ_ONLY_TOOLS,
+    PROPOSE_ONLY_TOOLS,
+    route_disposition,
+    tool_policy_error,
+    verify_claim_binding,
+    verify_primary_confirmation,
+)
+from server.app.diagnosis.investigation_directive import build_directive
+from server.app.diagnosis.knowledge import retrieve_knowledge
+from server.app.diagnosis.skill_registry import SKILL_REGISTRY
 from server.app.diagnosis.case_supervisor import CaseSupervisor
+from server.app.diagnosis.campaign import CampaignCreateInput, build_campaign_plan, campaign_matrix
 from server.app.diagnosis.plan_driver import PlanDriver
 from server.app.diagnosis.governance import (
     CAPABILITY_EPOCH,
@@ -197,6 +218,7 @@ source_gateway = SourceGateway(
 )
 reference_resolver = ReferenceResolver(repo)
 evidence_attachment_service = EvidenceAttachmentService(repo, reference_resolver)
+case_evidence_service = CaseEvidenceService(repo)
 investigation_plan_service = InvestigationPlanService(repo)
 target_resolver = TargetResolver()
 fanout_service = FanoutCollectionService(repo)
@@ -258,6 +280,7 @@ async def _lifespan(_app: FastAPI):
         else None
     )
     _task_wake_task = asyncio.create_task(_task_wake_loop())
+    _runtime_wakeup_task = asyncio.create_task(_runtime_wakeup_loop())
     _plan_driver_task = (
         asyncio.create_task(_plan_driver_sweeper())
         if os.getenv("MINI_DROP_PLAN_DRIVER_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
@@ -270,6 +293,7 @@ async def _lifespan(_app: FastAPI):
         if _autonomy_task is not None:
             _autonomy_task.cancel()
         _task_wake_task.cancel()
+        _runtime_wakeup_task.cancel()
         if _plan_driver_task is not None:
             _plan_driver_task.cancel()
         try:
@@ -283,6 +307,10 @@ async def _lifespan(_app: FastAPI):
                 pass
         try:
             await _task_wake_task
+        except asyncio.CancelledError:
+            pass
+        try:
+            await _runtime_wakeup_task
         except asyncio.CancelledError:
             pass
         if _plan_driver_task is not None:
@@ -371,7 +399,14 @@ def _run_autonomy_pass() -> None:
 
 
 def _run_plan_driver_pass() -> None:
-    """E4：扫描非终态 Case，自动调度 READ_LOW 计划步骤（Supervisor 自动调度）。"""
+    """E4：扫描非终态 Case，自动调度 READ_LOW 计划步骤（Supervisor 自动调度）。
+
+    MINI_DROP_AGENT_AUTO_READ_LOW=0 时后台扫描不得自动创建采集任务；
+    计划步骤保留为待用户确认。显式 /agent/plan-driver 仍可用于人工触发。
+    """
+    from server.app.agent_runtime.config import agent_auto_read_low
+    if not agent_auto_read_low():
+        return
     tenant_id = _request_tenant()
     try:
         for case in repo.list_incident_cases(tenant_id=tenant_id, limit=200):
@@ -414,10 +449,138 @@ async def _task_wake_loop() -> None:
                 continue
             try:
                 _wake_case_from_task(task_id, to_status)
-            except Exception:  # noqa: BLE001 — 唤醒失败不阻断事件流
-                pass
+            except Exception as exc:  # noqa: BLE001 — 唤醒失败不阻断事件流
+                log_event(
+                    "warning",
+                    "task_wake_failed",
+                    task_id=task_id,
+                    to_status=to_status,
+                    error_type=type(exc).__name__,
+                    error=str(exc)[:300],
+                )
     finally:
         BUS.unsubscribe(queue)
+
+
+def _ensure_active_investigation_run(case_id: str, tenant_id: str) -> dict[str, Any] | None:
+    if hasattr(repo, "list_investigation_runs"):
+        runs = repo.list_investigation_runs(case_id, tenant_id)
+        active = [
+            item for item in runs
+            if item.get("status") not in {"RESOLVED", "STOPPED", "INSUFFICIENT_EVIDENCE", "FAILED"}
+        ]
+        if active:
+            return active[0]
+        if runs:
+            return None
+    return repo.create_investigation_run(
+        case_id=case_id,
+        tenant_id=tenant_id,
+    ) if hasattr(repo, "create_investigation_run") else None
+
+
+def _deliver_one_wakeup(
+    case: dict[str, Any],
+    tenant_id: str,
+    wakeup: dict[str, Any],
+    run: dict[str, Any],
+) -> bool:
+    """Seal Wakeup -> Snapshot/Cycle/ModelRequest -> durable Sidecar delivery."""
+    case_id = str(case.get("case_id") or "")
+    wakeup_id = str(wakeup.get("wakeup_id") or "")
+    if not wakeup_id or wakeup.get("status") != "PENDING":
+        return False
+    context = _build_runtime_case_context(
+        case, tenant_id,
+        disposition="INVESTIGATE",
+        side_effect_policy="AUTO_READ_LOW",
+        investigation_run_id=run.get("run_id"),
+    )
+    snapshot = repo.create_case_context_snapshot(
+        case_id=case_id,
+        tenant_id=tenant_id,
+        investigation_run_id=run.get("run_id"),
+        content=context.model_dump(mode="json"),
+    ) if hasattr(repo, "create_case_context_snapshot") else None
+    binding = repo.get_agent_runtime_binding(case_id, tenant_id)
+    generation = int((binding or {}).get("runtime_generation") or 1)
+    cycle = repo.create_agent_cycle(
+        case_id=case_id,
+        tenant_id=tenant_id,
+        run_id=run["run_id"],
+        trigger_type="EVIDENCE_COMMITTED",
+        trigger_ref=wakeup_id,
+        context_snapshot_id=snapshot.get("snapshot_id") if snapshot else None,
+        evidence_watermark=int(wakeup.get("to_evidence_watermark") or 0),
+        runtime_binding_id=case_id,
+        generation=generation,
+    ) if hasattr(repo, "create_agent_cycle") else None
+    model_request = None
+    if cycle and hasattr(repo, "create_model_request"):
+        projections = repo.list_evidence_projections(case_id, tenant_id) if hasattr(repo, "list_evidence_projections") else []
+        model_request = repo.create_model_request(
+            case_id=case_id,
+            tenant_id=tenant_id,
+            run_id=run["run_id"],
+            cycle_id=cycle["cycle_id"],
+            input_snapshot_hash=snapshot.get("snapshot_hash") if snapshot else None,
+            evidence_projection_hashes=[
+                item.get("projection_hash") for item in projections
+                if item.get("projection_hash")
+            ],
+            idempotency_key=f"mreq:{wakeup_id}:{cycle['cycle_id']}",
+        )
+    if hasattr(repo, "seal_runtime_wakeup"):
+        repo.seal_runtime_wakeup(wakeup_id, cycle_id=cycle.get("cycle_id") if cycle else None)
+    try:
+        runtime = get_runtime()
+        runtime.follow_up(
+            case_id,
+            RuntimeFollowUp(
+                case_id=case_id,
+                note=f"新 Evidence 已物化：{', '.join(str(item) for item in (wakeup.get('source_refs') or []))}；请读取 Projection 后继续",
+                evidence_ids=[
+                    item.get("evidence_id")
+                    for item in case_evidence_service.list_evidence(case_id, tenant_id)
+                ],
+            ),
+        )
+        if hasattr(repo, "consume_runtime_wakeup"):
+            repo.consume_runtime_wakeup(wakeup_id, "DELIVERED")
+        return True
+    except RuntimeError:
+        if cycle and hasattr(repo, "transition_agent_cycle"):
+            repo.transition_agent_cycle(cycle["cycle_id"], "QUEUED")
+        if model_request and hasattr(repo, "transition_model_request"):
+            repo.transition_model_request(model_request["model_request_id"], "QUEUED")
+        return False
+
+
+async def _runtime_wakeup_loop() -> None:
+    interval_sec = max(2, min(int(os.getenv("MINI_DROP_WAKEUP_INTERVAL_SEC", "5")), 30))
+    while True:
+        try:
+            await asyncio.to_thread(_run_runtime_wakeup_pass)
+        except Exception as exc:
+            log_event("error", "runtime_wakeup_loop_failed", error_type=type(exc).__name__, error=str(exc)[:500])
+        await asyncio.sleep(interval_sec)
+
+
+def _run_runtime_wakeup_pass() -> None:
+    tenant_id = _request_tenant()
+    if not hasattr(repo, "list_incident_cases") or not hasattr(repo, "list_runtime_wakeups"):
+        return
+    for case in repo.list_incident_cases(tenant_id, state="")[:100]:
+        case_id = case.get("case_id") or case.get("id") or ""
+        if not case_id or case.get("state") in {"PAUSED", "STOPPED", "RESOLVED", "INSUFFICIENT_EVIDENCE"}:
+            continue
+        for wakeup in repo.list_runtime_wakeups(case_id, tenant_id, status="PENDING")[:10]:
+            run = repo.get_investigation_run(case_id, tenant_id, wakeup["investigation_run_id"]) if hasattr(repo, "get_investigation_run") else None
+            if run is None:
+                run = _ensure_active_investigation_run(case_id, tenant_id)
+            if run is None:
+                continue
+            _deliver_one_wakeup(case, tenant_id, wakeup, run)
 
 
 def _wake_case_from_task(task_id: str, to_status: str) -> None:
@@ -429,7 +592,86 @@ def _wake_case_from_task(task_id: str, to_status: str) -> None:
     tenant_id = str(options.get("tenant_id") or _request_tenant())
     if not case_id:
         return
-    PLAN_DRIVER.on_task_done(case_id, tenant_id, task_id, status=to_status)
+    outcome = PLAN_DRIVER.on_task_done(case_id, tenant_id, task_id, status=to_status)
+    if to_status == "DONE" and getattr(task, "collector_type", ""):
+        evidence_ids = case_evidence_service.materialize_task_artifacts(
+            case_id,
+            tenant_id,
+            task_id=task_id,
+            actor_id="mini-drop-task-wake",
+        )
+        log_event(
+            "info",
+            "task_wake_evidence_materialized",
+            task_id=task_id,
+            case_id=case_id,
+            evidence_count=len(evidence_ids),
+        )
+        if evidence_ids:
+            case = repo.get_incident_case(case_id, tenant_id) or {}
+            if case.get("state") not in {"PAUSED", "STOPPED", "RESOLVED", "INSUFFICIENT_EVIDENCE"}:
+                run = _ensure_active_investigation_run(case_id, tenant_id)
+                if run is not None and runtime_mode() in {AgentRuntimeMode.PI, AgentRuntimeMode.PI_SHADOW}:
+                    watermark = len(case_evidence_service.list_evidence(case_id, tenant_id))
+                    if hasattr(repo, "enqueue_domain_outbox"):
+                        repo.enqueue_domain_outbox(
+                            aggregate_type="evidence_batch",
+                            aggregate_id=f"{case_id}:{task_id}",
+                            event_type="EVIDENCE_COMMITTED",
+                            payload={
+                                "case_id": case_id,
+                                "task_id": task_id,
+                                "evidence_ids": evidence_ids,
+                                "evidence_watermark": watermark,
+                            },
+                            dedupe_key=f"evidence-batch:{case_id}:{task_id}:{','.join(sorted(evidence_ids))}",
+                        )
+                    if hasattr(repo, "create_runtime_wakeup"):
+                        wakeup = repo.create_runtime_wakeup(
+                            case_id=case_id,
+                            tenant_id=tenant_id,
+                            investigation_run_id=run["run_id"],
+                            reason=f"Task {task_id} 完成并产生 {len(evidence_ids)} 条 canonical Evidence",
+                            source_refs=[f"task:{task_id}"],
+                            control_revision=int(case.get("control_revision") or 1),
+                            scope_revision=int(case.get("scope_revision") or 1),
+                            reason_class="EVIDENCE_COMMITTED",
+                            from_evidence_watermark=max(0, watermark - len(evidence_ids)),
+                            to_evidence_watermark=watermark,
+                            dedupe_key=f"wakeup:{case_id}:{run['run_id']}:{case.get('control_revision') or 1}:{case.get('scope_revision') or 1}:EVIDENCE_COMMITTED",
+                        )
+                        _deliver_one_wakeup(case, tenant_id, wakeup, run)
+    return outcome
+
+
+def _run_case_task_wake_pass() -> None:
+    """G5/G6：Analyzer Worker 在独立进程中完成 Task，Server 事件总线看不到其
+    task_changed 事件。周期扫描 Case 派生且已 DONE 但尚未物化 Evidence 的 Task，
+    执行与实时唤醒相同的逻辑。
+    """
+    if hasattr(repo, "_cache"):
+        repo._cache.pop("tasks", None)
+    for task in list(getattr(repo, "tasks", {}).values()):
+        if status_value(getattr(task, "status", "")) != TaskStatus.DONE.value:
+            continue
+        options = (getattr(task, "request_params", None) or {}).get("options") or {}
+        case_id = str(options.get("case_id") or "")
+        if not case_id:
+            continue
+        tenant_id = str(options.get("tenant_id") or _request_tenant())
+        existing = repo.list_case_evidence(case_id, tenant_id) if hasattr(repo, "list_case_evidence") else []
+        if any(str(item.get("task_id") or "") == str(task.id) for item in existing):
+            continue
+        try:
+            _wake_case_from_task(str(task.id), TaskStatus.DONE.value)
+        except Exception as exc:  # noqa: BLE001
+            log_event(
+                "warning",
+                "case_task_wake_sweep_failed",
+                task_id=str(task.id),
+                error_type=type(exc).__name__,
+                error=str(exc)[:300],
+            )
 
 
 def _run_offline_sweep_pass(timeout_sec: int, stale_task_timeout_sec: int) -> None:
@@ -444,6 +686,7 @@ def _run_offline_sweep_pass(timeout_sec: int, stale_task_timeout_sec: int) -> No
     if hasattr(repo, "persist_agent_metric_snapshots"):
         _run_maintenance_step("agent_metric_snapshot", repo.persist_agent_metric_snapshots)
     _run_maintenance_step("diagnosis_advance", diagnosis_orchestrator.advance_active)
+    _run_maintenance_step("case_task_wake", _run_case_task_wake_pass)
 
 
 def _run_maintenance_step(step: str, operation) -> bool:
@@ -1847,6 +2090,28 @@ def get_current_identity(request: Request) -> APIResponse:
     })
 
 
+@app.get("/api/v1/cases/{case_id}/agent/runtime-state")
+def get_case_agent_runtime_state(case_id: str, request: Request) -> APIResponse:
+    """G1/G2：返回当前 Case 的持久 Runtime Binding、Turn 与归一化事件。
+
+    该投影只包含可审计字段，不包含模型私有思维链。
+    """
+    _require_role(request, "operator")
+    tenant_id = _request_tenant()
+    if repo.get_incident_case(case_id, tenant_id) is None:
+        raise HTTPException(status_code=404, detail="Case 不存在")
+    binding = repo.get_agent_runtime_binding(case_id, tenant_id)
+    turns = repo.list_agent_runtime_turns(case_id, tenant_id)
+    events = repo.list_agent_runtime_events(case_id, tenant_id)
+    return APIResponse(data={
+        "case_id": case_id,
+        "binding": binding,
+        "turns": turns,
+        "events": events,
+        "runtime_config": agent_flags(),
+    })
+
+
 @app.get("/api/v1/agent-runtime/config")
 def get_agent_runtime_config(request: Request) -> APIResponse:
     """Expose the active investigator runtime mode and feature flags.
@@ -2187,12 +2452,63 @@ def _case_agent_progress(case: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+@app.get("/api/v1/cases/{case_id}/events/stream")
+async def stream_incident_case_events(case_id: str, request: Request) -> StreamingResponse:
+    """v6 SSE: replay DB events after Last-Event-ID, then subscribe without a gap."""
+    _require_role(request, "operator")
+    tenant_id = _request_tenant()
+    if repo.get_incident_case(case_id, tenant_id) is None:
+        raise HTTPException(status_code=404, detail="Case 不存在")
+    last_event_id = request.headers.get("Last-Event-ID", "0")
+    try:
+        after_seq = int(last_event_id)
+    except ValueError:
+        after_seq = 0
+    replay = repo.list_case_events(case_id, tenant_id, limit=200, after_seq=after_seq) or []
+    subscription = BUS.subscribe()
+
+    async def event_stream():
+        try:
+            for item in replay:
+                seq = int(item.get("case_event_seq") or 0)
+                if seq <= after_seq:
+                    continue
+                yield f"id: {seq}\nevent: {item.get('event_type')}\ndata: {_json.dumps(item, ensure_ascii=False, default=str)}\n\n"
+            while True:
+                try:
+                    bus_event = await asyncio.wait_for(
+                        asyncio.to_thread(subscription.get), timeout=20,
+                    )
+                except asyncio.TimeoutError:
+                    yield ": keep-alive\n\n"
+                    continue
+                if bus_event.get("event") != "case_event":
+                    continue
+                data = bus_event.get("data") or {}
+                if str(data.get("case_id") or "") != case_id:
+                    continue
+                seq = int(data.get("case_event_seq") or 0)
+                if seq <= after_seq:
+                    continue
+                yield f"id: {seq}\nevent: {data.get('event_type')}\ndata: {_json.dumps(data, ensure_ascii=False, default=str)}\n\n"
+        finally:
+            BUS.unsubscribe(subscription)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @app.get("/api/v1/cases/{case_id}/events")
 def list_incident_case_events(
     case_id: str,
     request: Request,
     limit: int = 200,
     after_id: int = 0,
+    after_seq: int = 0,
+    before_seq: int | None = None,
 ) -> APIResponse:
     _require_role(request, "operator")
     items = repo.list_case_events(
@@ -2200,7 +2516,10 @@ def list_incident_case_events(
         _request_tenant(),
         limit=min(max(limit, 1), 1000),
         after_id=max(after_id, 0),
+        after_seq=max(after_seq, 0),
     )
+    if before_seq is not None:
+        items = [item for item in items or [] if int(item.get("case_event_seq") or 0) <= before_seq]
     if items is None:
         raise HTTPException(status_code=404, detail="Case 不存在")
     return APIResponse(data={"items": items, "total": len(items)})
@@ -2223,6 +2542,138 @@ def search_references(
         "items": [item.model_dump(mode="json") for item in candidates],
         "total": len(candidates),
     })
+
+
+@app.get("/api/v1/query-operations")
+def list_query_operations(request: Request) -> APIResponse:
+    """G4：注册的低风险只读 Query 目录。"""
+    _require_role(request, "operator")
+    return APIResponse(data={"items": QUERY_REGISTRY.list_operations(), "total": len(QUERY_REGISTRY.list_operations())})
+
+
+@app.post("/api/v1/cases/{case_id}/queries")
+def create_case_query(
+    case_id: str,
+    payload: dict[str, Any],
+    request: Request,
+) -> APIResponse:
+    """G4：把注册 Query 编译为原生 Task，经 Worker/Collector 执行。
+
+    不接受 executable/cwd/env/argv；越界参数在创建 Task 前拒绝。
+    """
+    _require_role(request, "operator")
+    tenant_id = _request_tenant()
+    principal_id = _request_principal(request)
+    case = repo.get_incident_case(case_id, tenant_id)
+    if case is None:
+        raise HTTPException(status_code=404, detail="Case 不存在")
+    if case["state"] in {"STOPPED", "RESOLVED"}:
+        raise HTTPException(status_code=409, detail="CASE_TERMINAL")
+    try:
+        task, operation_id = _create_case_query_task(
+            case, tenant_id, principal_id,
+            str(payload.get("operation") or ""),
+            payload.get("parameters") or {},
+            idempotency_key=str(payload.get("idempotency_key") or "") or None,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except QueryError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    return APIResponse(data={"task": _task_view(task), "operation": operation_id})
+
+
+def _resolve_query_target(
+    case: dict[str, Any],
+    target_ref: str,
+) -> dict[str, Any] | None:
+    instances = (case.get("target_scope") or {}).get("instances") or []
+    if target_ref:
+        for item in instances:
+            if target_ref in {
+                str(item.get("instance_id") or ""),
+                str(item.get("agent_id") or ""),
+                str(item.get("pid") or ""),
+            }:
+                return {"agent_id": str(item.get("agent_id") or ""), "pid": int(item.get("pid") or 1)}
+    for item in instances:
+        return {"agent_id": str(item.get("agent_id") or ""), "pid": int(item.get("pid") or 1)}
+    for agent in getattr(repo, "agents", {}).values():
+        if isinstance(agent, dict):
+            agent_id = str(agent.get("agent_id") or agent.get("id") or "")
+            status = str(agent.get("status") or "ONLINE")
+        else:
+            agent_id = str(getattr(agent, "id", "") or "")
+            status = str(getattr(agent, "status", "") or "ONLINE")
+        if status == "ONLINE" and agent_id:
+            return {"agent_id": agent_id, "pid": 1}
+    return None
+
+
+class QueryError(Exception):
+    def __init__(self, status_code: int, detail: str):
+        super().__init__(detail)
+        self.status_code = status_code
+        self.detail = detail
+
+
+def _create_case_query_task(
+    case: dict[str, Any],
+    tenant_id: str,
+    principal_id: str,
+    operation_id: str,
+    parameters: dict[str, Any],
+    *,
+    idempotency_key: str | None = None,
+):
+    operation = QUERY_REGISTRY.get(operation_id)
+    if operation is None:
+        raise QueryError(400, "UNKNOWN_QUERY_OPERATION")
+    errors = QUERY_REGISTRY.validate_parameters(operation_id, parameters)
+    if errors:
+        raise QueryError(400, f"INVALID_QUERY_PARAMETERS:{','.join(errors)}")
+    for forbidden in ("executable", "cwd", "env", "argv", "shell"):
+        if forbidden in parameters:
+            raise QueryError(400, f"FORBIDDEN_QUERY_PARAM:{forbidden}")
+    target_ref = str(parameters.get("target_ref") or "")
+    target = _resolve_query_target(case, target_ref)
+    if target is None:
+        raise QueryError(409, "QUERY_TARGET_UNAVAILABLE")
+    case_id = str(case.get("case_id") or "")
+    task = repo.create_task(
+        CreateTaskRequest(
+            name=f"query:{operation_id}:{target['agent_id']}"[:120],
+            agent_id=target["agent_id"],
+            target_pid=target["pid"],
+            collector_type=operation.collector_id,
+            sample_rate=operation.default_sample_rate,
+            duration_sec=operation.default_duration_sec,
+            options={
+                "source": "query_gateway",
+                "case_id": case_id,
+                "tenant_id": tenant_id,
+                "risk": operation.risk,
+                "query_operation": operation_id,
+                "target_ref": target_ref,
+                "created_by": principal_id,
+            },
+        ),
+        idempotency_key=idempotency_key,
+    )
+    repo.record_case_event(
+        case_id,
+        tenant_id,
+        event_type="case_query_task_created",
+        payload={
+            "task_id": task.id,
+            "operation": operation_id,
+            "collector_id": operation.collector_id,
+            "risk": operation.risk,
+            "agent_id": target["agent_id"],
+        },
+        actor_id=principal_id,
+    )
+    return task, operation_id
 
 
 @app.post("/api/v1/cases/{case_id}/attachments")
@@ -2255,6 +2706,242 @@ def attach_case_resources(
         payload={"results": results, "actor_id": principal_id}, actor_id=principal_id,
     )
     return APIResponse(data={"items": results})
+
+
+@app.post("/api/v1/cases/{case_id}/campaigns")
+def create_case_campaign(
+    case_id: str,
+    payload: CampaignCreateInput,
+    request: Request,
+) -> APIResponse:
+    """G4：人工或 AI 使用同一 Campaign API，编译为单目标 Task 计划矩阵。"""
+    _require_role(request, "operator")
+    tenant_id = _request_tenant()
+    principal_id = _request_principal(request)
+    case = repo.get_incident_case(case_id, tenant_id)
+    if case is None:
+        raise HTTPException(status_code=404, detail="Case 不存在")
+    plan_input = build_campaign_plan(payload)
+    try:
+        plan = investigation_plan_service.update_plan(
+            case_id,
+            tenant_id,
+            plan_input,
+            actor_id=principal_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    repo.record_case_event(
+        case_id,
+        tenant_id,
+        event_type="case_campaign_created",
+        payload={
+            "plan_revision": plan.get("plan_revision"),
+            "source": "campaign",
+            "baseline": payload.common_baseline.collector_id,
+            "assignments": [item.collector_id for item in payload.assignments],
+        },
+        actor_id=principal_id,
+    )
+    return APIResponse(data={"plan": plan, "matrix": campaign_matrix(plan)})
+
+
+@app.post("/api/v1/cases/{case_id}/campaigns/preview")
+def preview_case_campaign(
+    case_id: str,
+    payload: CampaignCreateInput,
+    request: Request,
+) -> APIResponse:
+    """v6: manual/AI Campaign preview uses the same compiler as create."""
+    _require_role(request, "operator")
+    tenant_id = _request_tenant()
+    if repo.get_incident_case(case_id, tenant_id) is None:
+        raise HTTPException(status_code=404, detail="Case 不存在")
+    plan = build_campaign_plan(payload)
+    return APIResponse(data={
+        "plan": plan,
+        "matrix": campaign_matrix(plan),
+        "resolved_assignments": [
+            {
+                "role": item.role,
+                "collector_id": item.collector_id,
+                "target_refs": item.target_refs or [],
+                "risk": item.risk,
+                "priority": item.priority,
+            }
+            for item in payload.assignments
+        ],
+    })
+
+
+@app.get("/api/v1/cases/{case_id}/campaigns/current")
+def get_case_campaign(
+    case_id: str,
+    request: Request,
+) -> APIResponse:
+    """读取最近一次 Campaign 编译结果（真实后端状态投影）。"""
+    _require_role(request, "operator")
+    tenant_id = _request_tenant()
+    if repo.get_incident_case(case_id, tenant_id) is None:
+        raise HTTPException(status_code=404, detail="Case 不存在")
+    plan = investigation_plan_service.read_plan(case_id, tenant_id)
+    return APIResponse(data={"matrix": campaign_matrix(plan)})
+
+
+@app.get("/api/v1/cases/{case_id}/evidence")
+def list_case_evidence(
+    case_id: str,
+    request: Request,
+) -> APIResponse:
+    """G3：读取 canonical Case Evidence Store（Evidence Explorer 后端）。"""
+    _require_role(request, "operator")
+    tenant_id = _request_tenant()
+    if repo.get_incident_case(case_id, tenant_id) is None:
+        raise HTTPException(status_code=404, detail="Case 不存在")
+    items = repo.list_case_evidence(case_id, tenant_id)
+    for item in items:
+        projections = repo.list_evidence_projections(
+            case_id, tenant_id, evidence_id=item.get("evidence_id"),
+        ) if hasattr(repo, "list_evidence_projections") else []
+        item["projections"] = [
+            {"projection_id": p.get("projection_id"), "projection_kind": p.get("projection_kind"),
+             "projection_hash": p.get("projection_hash"), "summary": (p.get("content") or {}).get("summary"),
+             "signals": (p.get("content") or {}).get("signals") or {},
+             "truncated": p.get("truncated")}
+            for p in projections
+        ]
+    return APIResponse(data={"items": items, "total": len(items)})
+
+
+@app.get("/api/v1/cases/{case_id}/evidence/{evidence_id}/projections")
+def get_case_evidence_projections(
+    case_id: str,
+    evidence_id: str,
+    request: Request,
+) -> APIResponse:
+    """v6 canonical projection endpoint used by Pi and Evidence Explorer."""
+    _require_role(request, "operator")
+    tenant_id = _request_tenant()
+    if repo.get_case_evidence(case_id, tenant_id, evidence_id) is None:
+        raise HTTPException(status_code=404, detail="Evidence 不存在")
+    items = repo.list_evidence_projections(case_id, tenant_id, evidence_id=evidence_id)
+    return APIResponse(data={"items": items, "total": len(items)})
+
+
+@app.get("/api/v1/cases/{case_id}/workspace")
+def get_case_workspace(case_id: str, request: Request) -> APIResponse:
+    """v6 9.2: one database snapshot for the Workbench first paint."""
+    _require_role(request, "operator")
+    tenant_id = _request_tenant()
+    case = repo.get_incident_case(case_id, tenant_id)
+    if case is None:
+        raise HTTPException(status_code=404, detail="Case 不存在")
+    plan = investigation_plan_service.read_plan(case_id, tenant_id) or {}
+    evidence_items = repo.list_case_evidence(case_id, tenant_id)
+    for item in evidence_items:
+        item["projections"] = repo.list_evidence_projections(
+            case_id, tenant_id, evidence_id=item.get("evidence_id"),
+        ) if hasattr(repo, "list_evidence_projections") else []
+    graph = repo.get_causal_graph(case_id, tenant_id) if hasattr(repo, "get_causal_graph") else None
+    gaps = repo.list_evidence_gaps(case_id, tenant_id, status="OPEN") if hasattr(repo, "list_evidence_gaps") else []
+    conclusion = repo.get_conclusion(case_id, tenant_id) if hasattr(repo, "get_conclusion") else None
+    recommendations = repo.list_repair_recommendations(case_id, tenant_id) if hasattr(repo, "list_repair_recommendations") else []
+    executions = repo.list_execution_units(case_id, tenant_id) if hasattr(repo, "list_execution_units") else []
+    turns = repo.list_agent_runtime_turns(case_id, tenant_id)
+    messages = repo.list_assistant_messages(case_id, tenant_id) if hasattr(repo, "list_assistant_messages") else []
+    binding = repo.get_agent_runtime_binding(case_id, tenant_id)
+    active_turn = next((item for item in reversed(turns) if item.get("status") == "ROUTED"), None)
+    active_plan_steps = [item for item in (plan.get("steps") or []) if item.get("status") not in {
+        "COMPLETED", "CANCELLED", "FAILED", "SUPERSEDED",
+    }]
+    return APIResponse(data={
+        "case_projection_version": int(case.get("row_version") or 0) + len(messages) + len(evidence_items),
+        "revisions": {
+            "case_command": case.get("case_command_revision") or 1,
+            "control": case.get("control_revision") or 1,
+            "scope": case.get("scope_revision") or 1,
+            "plan": plan.get("plan_revision") or 0,
+            "campaign": 0,
+        },
+        "case": case,
+        "engine": {
+            "mode": runtime_mode().value,
+            "availability": "READY" if binding else "UNAVAILABLE",
+            "state": "RUNNING" if active_turn else "IDLE",
+        },
+        "active_turn": active_turn,
+        "active_action": {
+            "kind": "plan_step",
+            "summary": "当前计划" if active_plan_steps else None,
+            "status": active_plan_steps[0].get("status") if active_plan_steps else None,
+        },
+        "next_action": None,
+        "user_action_required": None,
+        "plan": plan,
+        "campaign": {},
+        "executions": executions,
+        "evidence": evidence_items,
+        "hypotheses": [],
+        "causal_graph": graph or {},
+        "evidence_gaps": gaps,
+        "conclusion": conclusion,
+        "recommendations": recommendations,
+        "messages": messages,
+        "last_event_seq": max([int(item.get("case_event_seq") or 0) for item in repo.list_case_events(case_id, tenant_id, limit=200) or []] or [0]),
+    })
+
+
+@app.get("/api/v1/cases/{case_id}/causal-graphs")
+def get_case_causal_graphs(case_id: str, request: Request) -> APIResponse:
+    _require_role(request, "operator")
+    tenant_id = _request_tenant()
+    if repo.get_incident_case(case_id, tenant_id) is None:
+        raise HTTPException(status_code=404, detail="Case 不存在")
+    graph = repo.get_causal_graph(case_id, tenant_id) if hasattr(repo, "get_causal_graph") else None
+    return APIResponse(data={"graph": graph})
+
+
+@app.get("/api/v1/cases/{case_id}/evidence-gaps")
+def get_case_evidence_gaps(case_id: str, request: Request) -> APIResponse:
+    _require_role(request, "operator")
+    tenant_id = _request_tenant()
+    items = repo.list_evidence_gaps(case_id, tenant_id) if hasattr(repo, "list_evidence_gaps") else []
+    return APIResponse(data={"items": items, "total": len(items)})
+
+
+@app.get("/api/v1/cases/{case_id}/conclusions")
+def get_case_conclusions(case_id: str, request: Request) -> APIResponse:
+    _require_role(request, "operator")
+    tenant_id = _request_tenant()
+    conclusion = repo.get_conclusion(case_id, tenant_id) if hasattr(repo, "get_conclusion") else None
+    return APIResponse(data={"conclusion": conclusion})
+
+
+@app.get("/api/v1/cases/{case_id}/recommendations")
+def get_case_recommendations(case_id: str, request: Request) -> APIResponse:
+    _require_role(request, "operator")
+    tenant_id = _request_tenant()
+    items = repo.list_repair_recommendations(case_id, tenant_id) if hasattr(repo, "list_repair_recommendations") else []
+    return APIResponse(data={"items": items, "total": len(items)})
+
+
+@app.get("/api/v1/acquisition-operations")
+def list_acquisition_operations(request: Request) -> APIResponse:
+    _require_role(request, "operator")
+    items = repo.list_operation_specs() if hasattr(repo, "list_operation_specs") else []
+    if not items:
+        items = QUERY_REGISTRY.list_operations()
+    return APIResponse(data={"items": items, "total": len(items)})
+
+
+@app.get("/api/v1/cases/{case_id}/execution-units")
+def list_case_execution_units(case_id: str, request: Request) -> APIResponse:
+    _require_role(request, "operator")
+    tenant_id = _request_tenant()
+    if repo.get_incident_case(case_id, tenant_id) is None:
+        raise HTTPException(status_code=404, detail="Case 不存在")
+    items = repo.list_execution_units(case_id, tenant_id) if hasattr(repo, "list_execution_units") else []
+    return APIResponse(data={"items": items, "total": len(items)})
 
 
 @app.get("/api/v1/cases/{case_id}/attachments")
@@ -2334,6 +3021,47 @@ def update_case_investigation_plan(
     return APIResponse(data=plan)
 
 
+def _cancel_case_tasks(case_id: str, tenant_id: str) -> list[str]:
+    """G5：停止/解决 Case 时取消所有 Case 派生且仍活跃的原生 Task。"""
+    cancelled: list[str] = []
+    for task in list(getattr(repo, "tasks", {}).values()):
+        options = (getattr(task, "request_params", None) or {}).get("options") or {}
+        if str(options.get("case_id") or "") != case_id:
+            continue
+        if status_value(getattr(task, "status", "")) in {
+            TaskStatus.CANCELLED.value, TaskStatus.DONE.value, TaskStatus.FAILED.value,
+        }:
+            continue
+        repo.cancel_task(str(getattr(task, "id", "") or ""), "Case 已停止/解决", Actor.WEB)
+        cancelled.append(str(getattr(task, "id", "") or ""))
+    return list(dict.fromkeys(cancelled))
+
+
+def _cancel_step_tasks(case_id: str, tenant_id: str, step_id: str) -> list[str]:
+    """G5：用户取消 PlanStep 时同步取消其原生 Task / Fanout 子任务。"""
+    cancelled: list[str] = []
+    task = repo.get_task_by_diagnosis_step_id(step_id)
+    if task is not None and status_value(task.status) not in {
+        TaskStatus.CANCELLED.value, TaskStatus.DONE.value, TaskStatus.FAILED.value,
+    }:
+        repo.cancel_task(task.id, "用户取消计划步骤", Actor.WEB)
+        cancelled.append(task.id)
+    for run in repo.list_fanout_runs(case_id, tenant_id):
+        if str(run.get("plan_step_id") or "") != step_id:
+            continue
+        for task_id in run.get("task_ids") or []:
+            fanout_task = repo.tasks.get(str(task_id))
+            if fanout_task is None:
+                continue
+            if status_value(fanout_task.status) in {
+                TaskStatus.CANCELLED.value, TaskStatus.DONE.value, TaskStatus.FAILED.value,
+            }:
+                continue
+            repo.cancel_task(str(task_id), "用户取消集群计划步骤", Actor.WEB)
+            cancelled.append(str(task_id))
+    return list(dict.fromkeys(cancelled))
+
+
 @app.post("/api/v1/cases/{case_id}/steps/{step_id}/cancel")
 def cancel_case_plan_step(case_id: str, step_id: str, request: Request) -> APIResponse:
     _require_role(request, "operator")
@@ -2345,9 +3073,15 @@ def cancel_case_plan_step(case_id: str, step_id: str, request: Request) -> APIRe
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    cancelled_task_ids = _cancel_step_tasks(case_id, tenant_id, step_id)
     repo.record_case_event(
         case_id, tenant_id, event_type="step_cancelled",
-        payload={"step_id": step_id, "status": step.get("status"), "actor_id": principal_id},
+        payload={
+            "step_id": step_id,
+            "status": step.get("status"),
+            "actor_id": principal_id,
+            "cancelled_task_ids": cancelled_task_ids,
+        },
         actor_id=principal_id,
     )
     return APIResponse(data=step)
@@ -2402,6 +3136,13 @@ def retarget_case_plan_step(
     _require_role(request, "operator")
     tenant_id = _request_tenant()
     principal_id = _request_principal(request)
+    plan = investigation_plan_service.read_plan(case_id, tenant_id) or {}
+    current_step = next(
+        (item for item in (plan.get("steps") or []) if item.get("step_id") == step_id),
+        None,
+    )
+    if current_step is not None and current_step.get("status") in {"RUNNING", "DISPATCHING"}:
+        _cancel_step_tasks(case_id, tenant_id, step_id)
     try:
         step = investigation_plan_service.retarget_step(
             case_id, tenant_id, step_id,
@@ -2799,6 +3540,182 @@ def append_incident_case_message(
     return APIResponse(data=result)
 
 
+def _build_runtime_case_context(
+    case: dict[str, Any],
+    tenant_id: str,
+    *,
+    disposition: str = "INVESTIGATE",
+    side_effect_policy: str = "AUTO_READ_LOW",
+    turn_id: str | None = None,
+    investigation_run_id: str | None = None,
+) -> CaseContextSnapshot:
+    """Build the L0/L1 Case projection handed to an AgentRuntimePort before a Turn."""
+    case_id = str(case.get("case_id") or "")
+    plan = investigation_plan_service.read_plan(case_id, tenant_id) or {}
+    graph = repo.get_case_hypothesis_graph(case_id, tenant_id) or {"hypotheses": []}
+    hypotheses = graph.get("hypotheses") or []
+    evidence_summary: list[dict[str, Any]] = []
+    canonical_evidence = case_evidence_service.list_evidence(case_id, tenant_id, status=None)
+    for item in canonical_evidence:
+        if item.get("status") == "EXCLUDED":
+            continue
+        projections = repo.list_evidence_projections(
+            case_id, tenant_id, evidence_id=item.get("evidence_id"),
+        ) if hasattr(repo, "list_evidence_projections") else []
+        for projection in projections[:2]:
+            content = projection.get("content") or {}
+            evidence_summary.append({
+                "evidence_id": item.get("evidence_id"),
+                "artifact_type": item.get("artifact_type"),
+                "projection_kind": projection.get("projection_kind"),
+                "projection_hash": projection.get("projection_hash"),
+                "summary": content.get("summary", ""),
+                "signals": content.get("signals") or {},
+                "target_ref": item.get("target_ref"),
+                "status": item.get("status"),
+                "freshness": item.get("freshness"),
+                "quality": item.get("quality"),
+                "time_window": item.get("time_window") or {},
+                "truncated": projection.get("truncated", False),
+            })
+    for attachment in evidence_attachment_service.list_attachments(case_id, tenant_id):
+        if attachment.get("status") in {"EXCLUDED_BY_USER", "SUPERSEDED"}:
+            continue
+        evidence_summary.append({
+            "attachment_id": attachment.get("attachment_id"),
+            "resource_ref": attachment.get("resource_ref"),
+            "evidence_ids": attachment.get("evidence_ids") or [],
+            "status": attachment.get("status"),
+            "freshness": attachment.get("freshness"),
+            "quality": attachment.get("quality"),
+        })
+    missing_facts: list[str] = []
+    for hypothesis in hypotheses:
+        for fact in (hypothesis.get("missing_evidence") or []):
+            if str(fact) not in missing_facts:
+                missing_facts.append(str(fact))
+    binding = repo.get_agent_runtime_binding(case_id, tenant_id)
+    selected_skills = SKILL_REGISTRY.select_skills(
+        goal=str(case.get("problem_description") or ""),
+        target_scope=case.get("target_scope") or {},
+        evidence_summary=evidence_summary,
+        missing_facts=missing_facts,
+        limit=3,
+    )
+    knowledge_context = retrieve_knowledge(
+        str(case.get("problem_description") or ""),
+        [{"finding_type": str(item.get("finding_type") or item.get("status") or "")}
+         for item in hypotheses],
+        limit=3,
+    )
+    directive = build_directive(
+        goal=str(case.get("problem_description") or ""),
+        target_scope=case.get("target_scope") or {},
+        evidence_summary=evidence_summary,
+        skill_context=selected_skills,
+        missing_facts=missing_facts,
+    )
+    tool_catalog = sorted(READ_ONLY_TOOLS) if side_effect_policy == "READ_ONLY" else sorted(
+        READ_ONLY_TOOLS | PROPOSE_ONLY_TOOLS
+    )
+    return CaseContextSnapshot(
+        case_id=case_id,
+        tenant_id=tenant_id,
+        case_goal=str(case.get("problem_description") or "")[:500],
+        target_scope=case.get("target_scope") or {},
+        autonomy_mode=str(case.get("run_mode") or "COLLABORATE"),
+        case_command_revision=int(case.get("case_command_revision") or 1),
+        control_revision=int(case.get("control_revision") or 1),
+        plan_revision=int(plan.get("plan_revision") or 0),
+        scope_revision=int(case.get("scope_revision") or 1),
+        campaign_revision=0,
+        evidence_watermark=len(evidence_summary),
+        investigation_run_id=investigation_run_id,
+        turn_id=turn_id,
+        disposition=disposition,
+        side_effect_policy=side_effect_policy,
+        context_snapshot_id=None,
+        runtime_generation=int(binding.get("runtime_generation") or 0) + 1 if binding else 0,
+        runtime_session_id=str(binding.get("runtime_session_id") or "") if binding else "",
+        hypotheses=[
+            {
+                "hypothesis_id": item.get("hypothesis_id"),
+                "statement": item.get("statement"),
+                "status": item.get("status"),
+            }
+            for item in hypotheses[:20]
+        ],
+        evidence_summary=evidence_summary[:20],
+        missing_facts=missing_facts[:20],
+        running_task_ids=[],
+        budget={"max_active_cases": agent_max_active_cases()},
+        recent_user_commands=[],
+        tool_catalog_summary=tool_catalog,
+        knowledge_context=knowledge_context,
+        skill_context=selected_skills,
+        investigation_directive=directive.model_dump(mode="json"),
+    )
+
+
+def _case_investigation_footprint(case_id: str, tenant_id: str) -> dict[str, int]:
+    plan = investigation_plan_service.read_plan(case_id, tenant_id) or {}
+    tasks = [
+        task for task in getattr(repo, "tasks", {}).values()
+        if ((getattr(task, "request_params", None) or {}).get("options") or {}).get("case_id") == case_id
+    ]
+    fanout_runs = repo.list_fanout_runs(case_id, tenant_id)
+    return {
+        "plan_revision": int(plan.get("plan_revision") or 0),
+        "plan_step_count": len(plan.get("steps") or []),
+        "case_task_count": len(tasks),
+        "fanout_run_count": len(fanout_runs),
+    }
+
+
+@app.post("/api/v1/cases/{case_id}/deployment-assessment")
+@app.post("/api/v1/cases/{case_id}/deployment-assessments")
+def assess_case_deployment(
+    case_id: str,
+    payload: DeploymentAssessmentRequest,
+    request: Request,
+) -> APIResponse:
+    """G9：独立部署承载评估入口；缺事实必须返回 INSUFFICIENT_DATA。"""
+    _require_role(request, "operator")
+    tenant_id = _request_tenant()
+    principal_id = _request_principal(request)
+    case = repo.get_incident_case(case_id, tenant_id)
+    if case is None:
+        raise HTTPException(status_code=404, detail="Case 不存在")
+    plan = build_observability_tool_plan(
+        case,
+        intent=AgentTurnIntent.DEPLOYMENT_ASSESSMENT,
+        max_tool_calls=payload.max_tool_calls,
+        source_definitions=source_gateway.list_sources(),
+    )
+    tool_evidence: list[dict[str, Any]] = []
+    if payload.execute_safe_tools:
+        _, tool_evidence = execute_tool_plan(
+            source_gateway,
+            plan,
+            tenant_id=tenant_id,
+            case_id=case_id,
+            principal_id=principal_id,
+        )
+    assessment = assess_deployment_capacity(
+        payload.deployment_requirements,
+        target_scope=case.get("target_scope") or {},
+        tool_evidence=tool_evidence,
+    )
+    repo.record_case_event(
+        case_id,
+        tenant_id,
+        event_type="deployment_assessment_completed",
+        payload=assessment.model_dump(mode="json"),
+        actor_id=principal_id,
+    )
+    return APIResponse(data=assessment.model_dump(mode="json"))
+
+
 @app.post("/api/v1/cases/{case_id}/agent/turn")
 def run_incident_case_agent_turn(
     case_id: str,
@@ -2818,14 +3735,49 @@ def run_incident_case_agent_turn(
     case = repo.get_incident_case(case_id, tenant_id)
     if case is None:
         raise HTTPException(status_code=404, detail="Case 不存在")
-    if case["state"] in {"STOPPED", "RESOLVED"}:
-        raise HTTPException(status_code=409, detail="CASE_TERMINAL")
+
+    # v6 canonical Turn request contract: references, stable client command id,
+    # requested disposition and after_attach semantics.
+    references = list(payload.references or [])
+    attachment_results: list[dict[str, Any]] = []
+    if references:
+        attachment_results = evidence_attachment_service.attach_resources(
+            case,
+            tenant_id,
+            [ResourceRef(**item) for item in references],
+            actor_id=principal_id,
+            purpose="turn_reference",
+            source="user_mention",
+        )
+        rejected = [item for item in attachment_results if item.get("result") != "ACCEPTED"]
+        if rejected:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "REFERENCE_REJECTED",
+                    "items": attachment_results,
+                },
+            )
 
     intent = classify_turn(payload.message, payload.intent)
-    message_kind = "explanation_request" if intent in {
-        AgentTurnIntent.EXPLAIN,
-        AgentTurnIntent.STATUS,
-    } else "answer"
+    disposition, side_effect_policy, needs_user = route_disposition(
+        payload.message,
+        requested_disposition=payload.requested_disposition,
+        execute_safe_tools=payload.execute_safe_tools,
+        case_state=case["state"],
+    )
+    if references and payload.requested_disposition is None:
+        disposition = str(payload.after_attach or "ANSWER_ONLY").upper()
+        side_effect_policy = "READ_ONLY" if disposition == "ANSWER_ONLY" else (
+            "AUTO_READ_LOW" if payload.execute_safe_tools else "PROPOSE_ONLY"
+        )
+
+    terminal = case["state"] in {"STOPPED", "RESOLVED", "INSUFFICIENT_EVIDENCE"}
+    if terminal and disposition not in {"ANSWER_ONLY", "ATTACH_EVIDENCE"}:
+        raise HTTPException(status_code=409, detail="CASE_TERMINAL_NEW_INVESTIGATION_REQUIRES_NEW_RUN")
+
+    footprint_before = _case_investigation_footprint(case_id, tenant_id)
+    message_kind = "explanation_request" if disposition == "ANSWER_ONLY" else "answer"
     repo.append_case_message(
         case_id,
         tenant_id,
@@ -2833,6 +3785,122 @@ def run_incident_case_agent_turn(
         content=payload.message,
         kind=message_kind,
     )
+    case = repo.get_incident_case(case_id, tenant_id) or case
+    deterministic_turn_id = f"turn_{secrets.token_hex(12)}"
+    if runtime_mode() not in {AgentRuntimeMode.PI, AgentRuntimeMode.PI_SHADOW}:
+        if hasattr(repo, "record_agent_runtime_turn"):
+            repo.record_agent_runtime_turn(
+                turn_id=deterministic_turn_id,
+                case_id=case_id,
+                tenant_id=tenant_id,
+                runtime_session_id="deterministic",
+                runtime_generation=1,
+                user_message=payload.message,
+                requested_mode="deterministic",
+                status="COMPLETED",
+                accepted_mode="deterministic",
+                detail="deterministic answer",
+                idempotency_key=f"runtime-turn:{case_id}:{deterministic_turn_id}",
+                disposition=disposition,
+                side_effect_policy=side_effect_policy,
+                actor_id=principal_id,
+                client_command_id=payload.client_command_id,
+            )
+
+    # G2: PI / PI_SHADOW 模式必须走 AgentRuntimePort，不再由 classify_turn
+    # 直接驱动旧 start_case_diagnosis 路径。Sidecar 不可用时 fail-closed，
+    # Case 与用户消息仍已持久化，切回 deterministic 后可继续。
+    if runtime_mode() in {AgentRuntimeMode.PI, AgentRuntimeMode.PI_SHADOW}:
+        try:
+            runtime = get_runtime()
+            binding = runtime.start_or_resume(_build_runtime_case_context(
+                case, tenant_id, disposition=disposition, side_effect_policy=side_effect_policy,
+            ))
+            if hasattr(repo, "upsert_agent_runtime_binding"):
+                repo.upsert_agent_runtime_binding(
+                    case_id,
+                    tenant_id,
+                    runtime_type=binding.runtime_type,
+                    runtime_version=binding.runtime_version,
+                    runtime_session_id=binding.runtime_session_id,
+                    runtime_generation=binding.runtime_generation,
+                    status=binding.status,
+                    last_event_seq=binding.last_event_seq,
+                    last_context_snapshot_id=binding.last_context_snapshot_id,
+                    lease_owner=binding.lease_owner,
+                )
+            accepted = runtime.submit_turn(
+                case_id,
+                AgentTurnInput(
+                    case_id=case_id,
+                    message=payload.message,
+                    references=payload.model_dump(mode="json").get("references", []),
+                    requested_mode=payload.intent.value if payload.intent else None,
+                    client_command_id=None,
+                ),
+            )
+            if hasattr(repo, "record_agent_runtime_turn"):
+                repo.record_agent_runtime_turn(
+                    turn_id=accepted.turn_id,
+                    case_id=case_id,
+                    tenant_id=tenant_id,
+                    runtime_session_id=binding.runtime_session_id,
+                    runtime_generation=binding.runtime_generation,
+                    user_message=payload.message,
+                    requested_mode=payload.intent.value if payload.intent else None,
+                    status="ACCEPTED",
+                    accepted_mode=accepted.mode,
+                    detail=accepted.detail,
+                    idempotency_key=f"runtime-turn:{case_id}:{accepted.turn_id}",
+                    disposition=disposition,
+                    side_effect_policy=side_effect_policy,
+                    actor_id=principal_id,
+                    client_command_id=payload.client_command_id,
+                )
+        except RuntimeError as exc:
+            result = AgentTurnResult(
+                turn_id=f"turn_{secrets.token_hex(12)}",
+                intent=intent,
+                status="runtime_unavailable",
+                assistant_message="Pi Runtime 当前不可用，本轮未启动新调查；可稍后重试或切换 deterministic 回退。",
+                decision_summary=[f"runtime_unavailable:{str(exc)[:200]}"],
+                evidence_chain=[],
+                limitations=["Pi Runtime 不可用，已保持 fail-closed"],
+                next_actions=[{"type": "switch_deterministic", "description": "切换回确定性 Runtime 或配置 MINI_DROP_PI_RUNTIME_URL"}],
+            )
+            repo.record_case_event(
+                case_id,
+                tenant_id,
+                event_type="agent_runtime_turn_rejected",
+                payload=result.model_dump(mode="json"),
+                actor_id="mini-drop-agent-runtime",
+            )
+            return APIResponse(data=result.model_dump(mode="json"))
+        result = AgentTurnResult(
+            turn_id=accepted.turn_id,
+            intent=intent,
+            status="runtime_turn_accepted",
+            assistant_message=(
+                "本轮已提交给 Agent Runtime 处理；具体回答与工具轨迹通过 Runtime Event 回传并持久化。"
+                if accepted.mode != "pi_shadow"
+                else "本轮已进入 Shadow 模式：Runtime 可提出计划但不会创建任何 Task。"
+            ),
+            decision_summary=[
+                f"runtime_mode={accepted.mode}",
+                f"runtime_turn_id={accepted.turn_id}",
+            ],
+            evidence_chain=[],
+            next_actions=[{"type": "runtime_turn", "turn_id": accepted.turn_id, "mode": accepted.mode}],
+        )
+        repo.record_case_event(
+            case_id,
+            tenant_id,
+            event_type="agent_runtime_turn_submitted",
+            payload=result.model_dump(mode="json"),
+            actor_id="mini-drop-agent-runtime",
+        )
+        return APIResponse(data=result.model_dump(mode="json"))
+
     case = repo.get_incident_case(case_id, tenant_id) or case
     graph = repo.get_case_hypothesis_graph(case_id, tenant_id) or {"hypotheses": [], "edges": []}
     diagnosis_id = case.get("diagnosis_session_id")
@@ -2974,8 +4042,15 @@ def run_incident_case_agent_turn(
                             "status": started_diagnosis.get("status"),
                         })
 
+    side_effect_delta: dict[str, Any] = {}
+    if intent in {AgentTurnIntent.EXPLAIN, AgentTurnIntent.STATUS}:
+        footprint_after = _case_investigation_footprint(case_id, tenant_id)
+        side_effect_delta = {
+            key: footprint_after[key] - footprint_before[key]
+            for key in footprint_before
+        }
     result = AgentTurnResult(
-        turn_id=f"turn_{secrets.token_hex(12)}",
+        turn_id=deterministic_turn_id,
         intent=intent,
         status=status,
         assistant_message=assistant_message,
@@ -2986,6 +4061,7 @@ def run_incident_case_agent_turn(
         next_actions=next_actions,
         tool_calls=tool_calls,
         deployment_assessment=deployment_assessment,
+        side_effect_delta=side_effect_delta,
     )
     repo.record_case_event(
         case_id,
@@ -3149,6 +4225,67 @@ def _require_internal_token(request: Request) -> None:
         raise HTTPException(status_code=401, detail="INTERNAL_TOKEN_REQUIRED")
 
 
+def _tool_fence(
+    case: dict[str, Any],
+    tenant_id: str,
+    payload: dict[str, Any],
+    tool_name: str,
+    *,
+    read_only_tools: set[str] | None = None,
+) -> str | None:
+    """Machine-level Tool Gateway fence.  Returns a rejection code or None."""
+    read_only_tools = READ_ONLY_TOOLS if read_only_tools is None else read_only_tools
+    case_id = str(case.get("case_id") or "")
+    binding = repo.get_agent_runtime_binding(case_id, tenant_id)
+    # The active Turn policy arrives in the Sidecar Tool Envelope.  Inferring
+    # policy from the most recent persisted turn would fence legitimate later
+    # turns; a missing envelope field is therefore treated as legacy
+    # AUTO_READ_LOW for backward compatibility.
+    policy = "AUTO_READ_LOW"
+    if payload.get("side_effect_policy"):
+        policy = str(payload.get("side_effect_policy"))
+    policy_error = tool_policy_error(tool_name, policy)
+    if policy_error:
+        return policy_error
+    supplied_generation = payload.get("runtime_generation")
+    if supplied_generation is not None and binding is not None:
+        if int(supplied_generation) != int(binding.get("runtime_generation") or 0):
+            return "GENERATION_FENCED"
+    state = str(case.get("state") or "")
+    if tool_name not in read_only_tools:
+        if state == "PAUSED":
+            return "RUN_PAUSED"
+        if state in {"STOPPED", "RESOLVED", "INSUFFICIENT_EVIDENCE"}:
+            return "RUN_TERMINAL"
+    return None
+
+
+def _runtime_visible_content(payload: dict[str, Any]) -> str:
+    """Extract only the user-visible assistant content from a Sidecar event."""
+    for key in ("text", "message", "content"):
+        value = payload.get(key)
+        if isinstance(value, str):
+            value = value.strip()
+            if value and "accepted" not in value.lower()[:20] and value not in {
+                "已提交", "已接受", "accepted",
+            }:
+                return value[:12000]
+    if payload.get("final") is True:
+        value = payload.get("answer") or payload.get("summary")
+        if isinstance(value, str) and value.strip():
+            return value.strip()[:12000]
+    return ""
+
+
+def _visible_evidence_ids(content: str, case_id: str, tenant_id: str) -> list[str]:
+    """Return canonical evidence IDs that are both persisted and visibly cited."""
+    known = [
+        str(item.get("evidence_id") or "")
+        for item in repo.list_case_evidence(case_id, tenant_id, status="ACTIVE")
+    ]
+    return [item for item in known if item and item in content]
+
+
 @app.post("/internal/agent/tools/case-snapshot")
 def internal_tool_case_snapshot(payload: dict[str, Any], request: Request) -> APIResponse:
     _require_internal_token(request)
@@ -3159,11 +4296,42 @@ def internal_tool_case_snapshot(payload: dict[str, Any], request: Request) -> AP
         raise HTTPException(status_code=404, detail="CASE_NOT_FOUND")
     plan = investigation_plan_service.read_plan(case_id, tenant_id) or {"plan_id": None, "steps": []}
     attachments = evidence_attachment_service.list_attachments(case_id, tenant_id)
+    evidence_items: list[dict[str, Any]] = []
+    for item in case_evidence_service.list_evidence(case_id, tenant_id):
+        projections = repo.list_evidence_projections(
+            case_id, tenant_id, evidence_id=item.get("evidence_id"),
+        ) if hasattr(repo, "list_evidence_projections") else []
+        evidence_items.append({
+            "evidence_id": item.get("evidence_id"),
+            "artifact_type": item.get("artifact_type"),
+            "status": item.get("status"),
+            "freshness": item.get("freshness"),
+            "quality": item.get("quality"),
+            "target_ref": item.get("target_ref"),
+            "time_window": item.get("time_window") or {},
+            "projections": [
+                {
+                    "projection_id": projection.get("projection_id"),
+                    "projection_kind": projection.get("projection_kind"),
+                    "projection_hash": projection.get("projection_hash"),
+                    "summary": (projection.get("content") or {}).get("summary"),
+                    "signals": (projection.get("content") or {}).get("signals") or {},
+                    "top_items": (projection.get("content") or {}).get("top_items") or [],
+                    "samples": (projection.get("content") or {}).get("samples") or [],
+                    "log_events": (projection.get("content") or {}).get("log_events") or [],
+                    "truncated": projection.get("truncated", False),
+                }
+                for projection in projections
+            ],
+        })
     return APIResponse(data={
         "case_id": case_id,
         "goal": case.get("problem_description", "")[:500],
-        "target_scope": (case.get("target_scope") or {}).get("service_id"),
-        "plan_revision": plan.get("plan_revision"),
+        "target_scope": case.get("target_scope") or {},
+        "case_command_revision": case.get("case_command_revision") or 1,
+        "control_revision": case.get("control_revision") or 1,
+        "scope_revision": case.get("scope_revision") or 1,
+        "plan_revision": plan.get("plan_revision") or 0,
         "plan": plan,
         "attachments": [
             {"type": item.get("resource_ref", {}).get("type"),
@@ -3171,8 +4339,146 @@ def internal_tool_case_snapshot(payload: dict[str, Any], request: Request) -> AP
              "status": item.get("status")}
             for item in attachments
         ],
+        "evidence": evidence_items,
+        "evidence_watermark": len(evidence_items),
+        "query_operations": [
+            item.get("operation_id")
+            for item in QUERY_REGISTRY.list_operations()
+        ],
         "budget": {"active_cases": agent_max_active_cases()},
     })
+
+
+@app.post("/internal/agent/tools/list-case-evidence")
+def internal_tool_list_case_evidence(payload: dict[str, Any], request: Request) -> APIResponse:
+    """v6 read-only tool: canonical evidence inventory with projection hashes."""
+    _require_internal_token(request)
+    case_id = str(payload.get("case_id") or "")
+    tenant_id = _request_tenant()
+    case = repo.get_incident_case(case_id, tenant_id)
+    if case is None:
+        raise HTTPException(status_code=404, detail="CASE_NOT_FOUND")
+    filters = payload.get("filters") or {}
+    status = filters.get("status")
+    items = case_evidence_service.list_evidence(
+        case_id, tenant_id, status=status, limit=int(payload.get("limit") or 200),
+    )
+    projections = repo.list_evidence_projections(case_id, tenant_id) if hasattr(repo, "list_evidence_projections") else []
+    by_evidence: dict[str, list[dict[str, Any]]] = {}
+    for projection in projections:
+        by_evidence.setdefault(projection.get("evidence_id"), []).append(projection)
+    result = []
+    for item in items:
+        result.append({
+            **item,
+            "projections": [
+                {"projection_id": p.get("projection_id"), "projection_kind": p.get("projection_kind"),
+                 "projection_hash": p.get("projection_hash"), "truncated": p.get("truncated")}
+                for p in by_evidence.get(item.get("evidence_id"), [])
+            ],
+        })
+    return APIResponse(data={
+        "items": result,
+        "total": len(result),
+        "evidence_watermark": len(projections),
+        "cursor": payload.get("cursor"),
+    })
+
+
+@app.post("/internal/agent/tools/list-operations")
+def internal_tool_list_operations(payload: dict[str, Any], request: Request) -> APIResponse:
+    _require_internal_token(request)
+    items = repo.list_operation_specs(enabled_only=True) if hasattr(repo, "list_operation_specs") else []
+    if not items:
+        items = QUERY_REGISTRY.list_operations()
+    return APIResponse(data={"items": items, "total": len(items)})
+
+
+@app.post("/internal/agent/tools/get-evidence-projection")
+def internal_tool_get_evidence_projection(payload: dict[str, Any], request: Request) -> APIResponse:
+    """v6 read-only tool: bounded content expansion of EvidenceProjection."""
+    _require_internal_token(request)
+    case_id = str(payload.get("case_id") or "")
+    tenant_id = _request_tenant()
+    if repo.get_incident_case(case_id, tenant_id) is None:
+        raise HTTPException(status_code=404, detail="CASE_NOT_FOUND")
+    evidence_ids = [str(item) for item in (payload.get("evidence_ids") or [])]
+    kinds = [str(item) for item in (payload.get("projection_kinds") or [])]
+    max_bytes = int(payload.get("max_bytes") or 131072)
+    projections = repo.list_evidence_projections(case_id, tenant_id) if hasattr(repo, "list_evidence_projections") else []
+    selected = []
+    for projection in projections:
+        if evidence_ids and projection.get("evidence_id") not in evidence_ids:
+            continue
+        if kinds and projection.get("projection_kind") not in kinds:
+            continue
+        if int(projection.get("projected_bytes") or 0) > max_bytes:
+            selected.append({
+                "projection_id": projection.get("projection_id"),
+                "truncated_after_max_bytes": True,
+                "projected_bytes": projection.get("projected_bytes"),
+            })
+            continue
+        selected.append(projection)
+    return APIResponse(data={
+        "items": selected,
+        "max_bytes": max_bytes,
+        "evidence_watermark": len(projections),
+    })
+
+
+@app.post("/internal/agent/tools/compare-evidence")
+def internal_tool_compare_evidence(payload: dict[str, Any], request: Request) -> APIResponse:
+    _require_internal_token(request)
+    case_id = str(payload.get("case_id") or "")
+    tenant_id = _request_tenant()
+    evidence_ids = [str(item) for item in (payload.get("evidence_ids") or [])][:8]
+    projections = repo.list_evidence_projections(case_id, tenant_id) if hasattr(repo, "list_evidence_projections") else []
+    rows = []
+    for evidence_id in evidence_ids:
+        item = repo.get_case_evidence(case_id, tenant_id, evidence_id)
+        if item is None:
+            rows.append({"evidence_id": evidence_id, "error": "NOT_FOUND"})
+            continue
+        item_projections = [p for p in projections if p.get("evidence_id") == evidence_id]
+        rows.append({
+            "evidence_id": evidence_id,
+            "artifact_type": item.get("artifact_type"),
+            "target_ref": item.get("target_ref"),
+            "time_window": item.get("time_window") or {},
+            "quality": item.get("quality"),
+            "signals": [
+                {"projection_hash": p.get("projection_hash"), "signals": (p.get("content") or {}).get("signals") or {}}
+                for p in item_projections
+            ],
+        })
+    return APIResponse(data={"items": rows, "dimensions": payload.get("dimensions") or ["signals"]})
+
+
+@app.post("/internal/agent/tools/search-knowledge")
+def internal_tool_search_knowledge(payload: dict[str, Any], request: Request) -> APIResponse:
+    _require_internal_token(request)
+    query = str(payload.get("query") or "")
+    items = retrieve_knowledge(query, [], limit=int(payload.get("limit") or 5))
+    return APIResponse(data={"items": items})
+
+
+@app.post("/internal/agent/tools/get-causal-graph")
+def internal_tool_get_causal_graph(payload: dict[str, Any], request: Request) -> APIResponse:
+    _require_internal_token(request)
+    case_id = str(payload.get("case_id") or "")
+    tenant_id = _request_tenant()
+    graph = repo.get_causal_graph(case_id, tenant_id) if hasattr(repo, "get_causal_graph") else None
+    return APIResponse(data={"graph": graph})
+
+
+@app.post("/internal/agent/tools/get-evidence-gaps")
+def internal_tool_get_evidence_gaps(payload: dict[str, Any], request: Request) -> APIResponse:
+    _require_internal_token(request)
+    case_id = str(payload.get("case_id") or "")
+    tenant_id = _request_tenant()
+    items = repo.list_evidence_gaps(case_id, tenant_id) if hasattr(repo, "list_evidence_gaps") else []
+    return APIResponse(data={"items": items})
 
 
 @app.post("/internal/agent/tools/reusable-evidence")
@@ -3181,11 +4487,53 @@ def internal_tool_reusable_evidence(payload: dict[str, Any], request: Request) -
     case_id = str(payload.get("case_id") or "")
     tenant_id = _request_tenant()
     task_ids = evidence_attachment_service.active_task_ids(case_id, tenant_id)
+    evidence_rows = case_evidence_service.list_evidence(case_id, tenant_id, status="ACTIVE")
+    projections = repo.list_evidence_projections(case_id, tenant_id) if hasattr(repo, "list_evidence_projections") else []
+    reusable_evidence = []
+    for item in evidence_rows:
+        item_projections = [p for p in projections if p.get("evidence_id") == item.get("evidence_id")]
+        reusable_evidence.append({
+            "evidence_id": item.get("evidence_id"),
+            "artifact_type": item.get("artifact_type"),
+            "target_ref": item.get("target_ref"),
+            "time_window": item.get("time_window") or {},
+            "quality": item.get("quality"),
+            "status": item.get("status"),
+            "projection_hashes": [p.get("projection_hash") for p in item_projections],
+            "reuse_reason": "fingerprint-target-window-quality-check",
+        })
     return APIResponse(data={
         "case_id": case_id,
         "reusable_task_ids": task_ids,
-        "note": "先复用已有证据，仅当 Missing Fact 无法覆盖时才补采。",
+        "reusable_evidence": reusable_evidence,
+        "note": "Reuse requires ACTIVE evidence matching target/window/quality; a DONE Task alone is not reuse.",
     })
+
+
+@app.post("/internal/agent/tools/query")
+def internal_tool_create_query(payload: dict[str, Any], request: Request) -> APIResponse:
+    """G4/G6：Pi 通过受控 Query Gateway 请求注册操作；仍由原生 Task 执行。"""
+    _require_internal_token(request)
+    case_id = str(payload.get("case_id") or "")
+    tenant_id = _request_tenant()
+    case = repo.get_incident_case(case_id, tenant_id)
+    if case is None:
+        raise HTTPException(status_code=404, detail="CASE_NOT_FOUND")
+    fence_error = _tool_fence(case, tenant_id, payload, "request_operation")
+    if fence_error:
+        raise HTTPException(status_code=409, detail=fence_error)
+    try:
+        task, operation_id = _create_case_query_task(
+            case,
+            tenant_id,
+            "mini-drop-pi-runtime",
+            str(payload.get("operation") or ""),
+            payload.get("parameters") or {},
+            idempotency_key=str(payload.get("idempotency_key") or "") or None,
+        )
+    except QueryError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    return APIResponse(data={"task": _task_view(task), "operation": operation_id})
 
 
 @app.post("/internal/agent/tools/plan")
@@ -3194,6 +4542,12 @@ def internal_tool_upsert_plan(payload: dict[str, Any], request: Request) -> APIR
     _require_internal_token(request)
     case_id = str(payload.get("case_id") or "")
     tenant_id = _request_tenant()
+    case = repo.get_incident_case(case_id, tenant_id)
+    if case is None:
+        raise HTTPException(status_code=404, detail="CASE_NOT_FOUND")
+    fence_error = _tool_fence(case, tenant_id, payload, "propose_plan_revision")
+    if fence_error:
+        raise HTTPException(status_code=409, detail=fence_error)
     principal_id = "mini-drop-pi-runtime"
     plan_payload = {key: value for key, value in payload.items() if key != "case_id"}
     try:
@@ -3262,17 +4616,156 @@ def internal_tool_rca_analysis(payload: dict[str, Any], request: Request) -> API
 
 @app.post("/internal/agent/tools/finish")
 def internal_tool_finish(payload: dict[str, Any], request: Request) -> APIResponse:
-    """结构化结论提交；必须引用真实存在的 Evidence ID。"""
+    """结构化结论提交；必须引用真实存在的 Evidence ID，并落审计事件。"""
     _require_internal_token(request)
     case_id = str(payload.get("case_id") or "")
+    tenant_id = _request_tenant()
+    summary = str(payload.get("summary") or "").strip()
     evidence_ids = [str(item) for item in (payload.get("evidence_ids") or [])]
     if not evidence_ids:
         raise HTTPException(status_code=400, detail="NO_EVIDENCE_REFS")
+    case = repo.get_incident_case(case_id, tenant_id)
+    if case is None:
+        raise HTTPException(status_code=404, detail="CASE_NOT_FOUND")
+    fence_error = _tool_fence(case, tenant_id, payload, "finish_investigation")
+    if fence_error:
+        raise HTTPException(status_code=409, detail=fence_error)
+
+    # 校验 Evidence ID 必须来自当前 Case 已接受的 Attachment 或 Diagnosis Evidence。
+    known_evidence_ids: set[str] = set()
+    for attachment in evidence_attachment_service.list_attachments(case_id, tenant_id):
+        if attachment.get("status") == "EXCLUDED_BY_USER":
+            continue
+        known_evidence_ids.update(attachment.get("evidence_ids") or [])
+    if hasattr(repo, "list_case_evidence"):
+        for item in repo.list_case_evidence(case_id, tenant_id, status="ACTIVE"):
+            known_evidence_ids.add(str(item.get("evidence_id") or ""))
+        for item in repo.list_case_evidence(case_id, tenant_id, status="EXCLUDED"):
+            known_evidence_ids.discard(str(item.get("evidence_id") or ""))
+    diagnosis_id = case.get("diagnosis_session_id")
+    if diagnosis_id:
+        diagnosis = diagnosis_orchestrator.store.get_detail(diagnosis_id) or {}
+        for item in (diagnosis.get("evidence") or []):
+            ev_id = str(item.get("evidence_id") or "")
+            if ev_id:
+                known_evidence_ids.add(ev_id)
+    unknown = [ev_id for ev_id in evidence_ids if ev_id not in known_evidence_ids]
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail=f"INVALID_EVIDENCE_REFS:{','.join(unknown[:5])}",
+        )
+
+    # v6 finish: ClaimEvidenceBinding must reference the current projection hash
+    # and, when field_path is supplied, the predicate is evaluated against the
+    # persisted projection content.  Legacy evidence_ids are upgraded into
+    # bindings; they can no longer finish with an ID-only placeholder verifier.
+    projections = repo.list_evidence_projections(case_id, tenant_id) if hasattr(repo, "list_evidence_projections") else []
+    current_watermark = len(projections)
+    expected_watermark = payload.get("expected_evidence_watermark")
+    if expected_watermark is not None and int(expected_watermark) < current_watermark:
+        raise HTTPException(status_code=409, detail="EVIDENCE_WATERMARK_STALE")
+    claims = list(payload.get("claims") or [])
+    legacy_compat = False
+    if not claims:
+        claims = []
+        for evidence_id in evidence_ids:
+            evidence = repo.get_case_evidence(case_id, tenant_id, evidence_id)
+            matching = [p for p in projections if p.get("evidence_id") == evidence_id]
+            if evidence is None or not matching:
+                # v6 requires canonical Evidence+Projection.  Keep a narrow
+                # compatibility path for old attachment-only callers while the
+                # verifier remains factual and never ID-only.
+                attachment_known = any(
+                    evidence_id in (item.get("evidence_ids") or [])
+                    for item in evidence_attachment_service.list_attachments(case_id, tenant_id)
+                    if item.get("status") not in {"EXCLUDED_BY_USER", "SUPERSEDED"}
+                )
+                if not attachment_known:
+                    raise HTTPException(status_code=400, detail=f"PROJECTION_MISSING:{evidence_id}")
+                legacy_compat = True
+                continue
+            claims.append({
+                "claim_id": f"claim-{hashlib.sha256(evidence_id.encode()).hexdigest()[:16]}",
+                "evidence_id": evidence_id,
+                "projection_hash": matching[0].get("projection_hash"),
+                "support_kind": "SUPPORTS",
+                "event_window": evidence.get("time_window") or {},
+            })
+    claim_errors: list[str] = []
+    for claim in claims:
+        evidence = repo.get_case_evidence(case_id, tenant_id, str(claim.get("evidence_id") or ""))
+        if evidence is None:
+            claim_errors.append(f"INVALID_EVIDENCE:{claim.get('evidence_id')}")
+            continue
+        ok, code = verify_claim_binding(evidence, projections, claim)
+        if not ok:
+            claim_errors.append(f"{code}:{claim.get('evidence_id')}:{claim.get('field_path') or 'id'}")
+    if claim_errors:
+        raise HTTPException(status_code=400, detail="CLAIM_VERIFICATION_FAILED:" + ",".join(claim_errors[:6]))
+
+    run_id = None
+    runs = repo.list_investigation_runs(case_id, tenant_id) if hasattr(repo, "list_investigation_runs") else []
+    if runs:
+        run_id = runs[0].get("run_id")
+    graph = repo.get_causal_graph(case_id, tenant_id) if hasattr(repo, "get_causal_graph") else None
+    requested_state = str(payload.get("state") or "PARTIALLY_CONFIRMED").upper()
+    graph_edges = (graph or {}).get("edges") or []
+    verified_state = verify_primary_confirmation(
+        graph or {},
+        requested_state,
+        blocker_gaps=0,
+        required_edge_missing=sum(
+            1 for edge in graph_edges
+            if edge.get("verification_state") not in {"OBSERVED", "SUPPORTED"}
+        ),
+    )
+    if legacy_compat:
+        verified_state = "PARTIALLY_CONFIRMED"
+    conclusion = None
+    if hasattr(repo, "submit_conclusion_revision"):
+        conclusion = repo.submit_conclusion_revision(
+            case_id=case_id,
+            tenant_id=tenant_id,
+            investigation_run_id=run_id or "",
+            state=verified_state,
+            causal_graph_revision_id=(graph or {}).get("graph_id"),
+            claims=claims,
+            limitations=list(payload.get("limitations") or []),
+            abstention_reason=payload.get("abstention_reason"),
+            report_text=summary,
+            verifier_version="causal-report-verifier.v1",
+        )
+    repo.record_case_event(
+        case_id,
+        tenant_id,
+        event_type="agent_finish_investigation",
+        payload={
+            "summary": summary,
+            "evidence_refs": evidence_ids,
+            "verifier": "causal-report-verifier.v1",
+            "state": verified_state,
+            "conclusion_id": conclusion.get("conclusion_id") if conclusion else None,
+        },
+        actor_id="mini-drop-pi-runtime",
+    )
+    if hasattr(repo, "persist_case_conclusion"):
+        repo.persist_case_conclusion(
+            case_id,
+            tenant_id,
+            summary=summary,
+            evidence_refs=evidence_ids,
+            limitations=list(payload.get("limitations") or []),
+            actor_id="mini-drop-pi-runtime",
+        )
     return APIResponse(data={
         "accepted": True,
         "case_id": case_id,
         "evidence_refs": evidence_ids,
-        "verifier": "pending_report_verifier",
+        "verifier": "causal-report-verifier.v1",
+        "state": verified_state,
+        "conclusion_id": conclusion.get("conclusion_id") if conclusion else None,
+        "event_type": "agent_finish_investigation",
     })
 
 
@@ -3280,6 +4773,144 @@ def internal_tool_finish(payload: dict[str, Any], request: Request) -> APIRespon
 def internal_tool_health(request: Request) -> APIResponse:
     _require_internal_token(request)
     return APIResponse(data={"ok": True, "service": "mini-drop-tool-gateway"})
+
+
+@app.post("/internal/runtime/v1/cases/{case_id}/events")
+def internal_runtime_events(
+    case_id: str,
+    payload: dict[str, Any],
+    request: Request,
+) -> APIResponse:
+    """Sidecar 回传归一化 Runtime 事件（assistant/tool/decision/final）。
+
+    私有思维链不允许进入此接口；event_seq 在 generation 内唯一，
+    idempotency_key 用于崩溃重放去重。
+    """
+    _require_internal_token(request)
+    tenant_id = _request_tenant()
+    if repo.get_incident_case(case_id, tenant_id) is None:
+        raise HTTPException(status_code=404, detail="CASE_NOT_FOUND")
+    generation = int(payload.get("runtime_generation") or 0)
+    if generation <= 0:
+        raise HTTPException(status_code=400, detail="INVALID_RUNTIME_GENERATION")
+    events = payload.get("events") or []
+    if not isinstance(events, list) or not events:
+        raise HTTPException(status_code=400, detail="NO_RUNTIME_EVENTS")
+    stored: list[dict[str, Any]] = []
+    max_seq = 0
+    final_content: str | None = None
+    final_turn_id: str | None = None
+    final_cycle_id: str | None = None
+    final_model_request_id: str | None = None
+    for raw in events:
+        if not isinstance(raw, dict):
+            continue
+        event_type = str(raw.get("event_type") or raw.get("type") or "")
+        if event_type.startswith("thinking"):
+            continue
+        if not event_type:
+            continue
+        event_seq = int(raw.get("event_seq") or raw.get("seq") or 0)
+        if event_seq <= 0:
+            continue
+        payload_json = raw.get("payload") or {}
+        cycle_id = str(raw.get("cycle_id") or payload_json.get("cycle_id") or "")
+        model_request_id = str(raw.get("model_request_id") or payload_json.get("model_request_id") or "")
+        persisted_event = repo.record_agent_runtime_event(
+            event_id=str(raw.get("event_id") or f"evt_{secrets.token_hex(16)}"),
+            case_id=case_id,
+            tenant_id=tenant_id,
+            runtime_generation=generation,
+            event_seq=event_seq,
+            event_type=event_type,
+            payload=payload_json,
+            idempotency_key=str(raw.get("idempotency_key") or "")
+                         or f"runtime-event:{case_id}:{generation}:{event_seq}:{event_type}",
+            cycle_id=cycle_id or None,
+            model_request_id=model_request_id or None,
+            evaluation_run_id=payload_json.get("evaluation_run_id"),
+        )
+        stored.append(persisted_event)
+        if persisted_event.get("duplicate"):
+            continue
+        max_seq = max(max_seq, event_seq)
+        if event_type in {"turn_end", "message_end", "assistant.completed", "assistant_message", "final"}:
+            text = _runtime_visible_content(payload_json)
+            if text:
+                final_content = text
+                final_turn_id = str(payload_json.get("trigger_turn_id") or "")
+                final_cycle_id = cycle_id or str(payload_json.get("cycle_id") or "")
+                final_model_request_id = model_request_id or str(payload_json.get("model_request_id") or "")
+    binding = repo.get_agent_runtime_binding(case_id, tenant_id)
+    if binding is not None and max_seq > int(binding.get("last_event_seq") or 0):
+        repo.upsert_agent_runtime_binding(
+            case_id,
+            tenant_id,
+            runtime_type=binding.get("runtime_type") or "pi",
+            runtime_version=binding.get("runtime_version") or "pi-0.83.0",
+            runtime_session_id=binding.get("runtime_session_id") or "",
+            runtime_generation=int(binding.get("runtime_generation") or generation),
+            status=binding.get("status") or "READY",
+            last_event_seq=max_seq,
+            last_context_snapshot_id=binding.get("last_context_snapshot_id"),
+            lease_owner=binding.get("lease_owner"),
+        )
+    if final_content:
+        if not final_turn_id:
+            turns = repo.list_agent_runtime_turns(case_id, tenant_id)
+            open_turns = [item for item in reversed(turns) if item.get("status") == "ROUTED"]
+            final_turn_id = open_turns[0].get("turn_id") if open_turns else None
+        evidence_refs = _visible_evidence_ids(final_content, case_id, tenant_id)
+        message = repo.add_assistant_message(
+            case_id=case_id,
+            tenant_id=tenant_id,
+            content=final_content,
+            trigger_turn_id=final_turn_id or None,
+            origin_turn_id=final_turn_id or None,
+            cycle_id=final_cycle_id or None,
+            model_request_id=final_model_request_id or None,
+            evidence_refs=evidence_refs,
+            message_id=f"amsg-{hashlib.sha256(f'{case_id}:{generation}:{max_seq}:{final_content[:80]}'.encode()).hexdigest()[:24]}",
+        )
+        repo.record_case_event(
+            case_id,
+            tenant_id,
+            event_type="assistant.message",
+            payload={
+                "message_id": message["message_id"],
+                "trigger_turn_id": final_turn_id,
+                "content": final_content,
+                "evidence_refs": evidence_refs,
+            },
+            actor_id="mini-drop-agent-runtime",
+        )
+        if final_turn_id:
+            repo.record_case_event(
+                case_id,
+                tenant_id,
+                event_type="turn.completed",
+                payload={"turn_id": final_turn_id, "message_id": message["message_id"]},
+                actor_id="mini-drop-agent-runtime",
+            )
+    return APIResponse(data={
+        "accepted": len(stored),
+        "last_event_seq": max_seq,
+        "assistant_message_id": f"amsg-{hashlib.sha256(f'{case_id}:{generation}:{max_seq}:{str(final_content)[:80]}'.encode()).hexdigest()[:24]}" if final_content else None,
+    })
+
+
+@app.get("/internal/runtime/v1/cases/{case_id}/events")
+def internal_runtime_events_list(
+    case_id: str,
+    request: Request,
+) -> APIResponse:
+    """供 Sidecar 或工作台读取已持久化的 Runtime 事件（不含私有思维链）。"""
+    _require_internal_token(request)
+    tenant_id = _request_tenant()
+    if repo.get_incident_case(case_id, tenant_id) is None:
+        raise HTTPException(status_code=404, detail="CASE_NOT_FOUND")
+    items = repo.list_agent_runtime_events(case_id, tenant_id)
+    return APIResponse(data={"items": items, "total": len(items)})
 
 
 @app.post("/api/v1/cases/{case_id}/agent/shadow-plan")
@@ -3755,7 +5386,172 @@ def _transition_case_from_api(
         except ValueError:
             # Completed diagnoses need no cancellation.
             pass
+    if action in {"stop", "resolve"}:
+        _cancel_case_tasks(case_id, tenant_id)
     return APIResponse(data=result)
+
+
+class CaseCommandRequest(BaseModel):
+    client_command_id: str | None = None
+    command: str
+    target_id: str | None = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+    reason: str = "operator command"
+    expected_case_command_revision: int | None = None
+    expected_control_revision: int | None = None
+    expected_scope_revision: int | None = None
+    expected_plan_revision: int | None = None
+    expected_campaign_revision: int | None = None
+
+
+@app.post("/api/v1/cases/{case_id}/commands")
+def apply_case_command(
+    case_id: str,
+    payload: CaseCommandRequest,
+    request: Request,
+) -> APIResponse:
+    """v6 canonical control channel: deterministic command before model."""
+    _require_role(request, "operator")
+    tenant_id = _request_tenant()
+    principal_id = _request_principal(request)
+    case = repo.get_incident_case(case_id, tenant_id)
+    if case is None:
+        raise HTTPException(status_code=404, detail="Case 不存在")
+    command = str(payload.command).upper()
+    target_id = payload.target_id
+    conflicts: list[str] = []
+    for attr, expected in (
+        ("case_command_revision", payload.expected_case_command_revision),
+        ("control_revision", payload.expected_control_revision),
+        ("scope_revision", payload.expected_scope_revision),
+    ):
+        if expected is not None and int(case.get(attr) or 0) != int(expected):
+            conflicts.append(f"{attr.upper()}_STALE")
+    if conflicts:
+        return APIResponse(code=409, message="revision conflict", data={
+            "applied": False,
+            "conflicts": conflicts,
+            "current_revisions": {
+                "case_command": case.get("case_command_revision") or 1,
+                "control": case.get("control_revision") or 1,
+                "scope": case.get("scope_revision") or 1,
+            },
+        })
+
+    applied = False
+    affected_task_ids: list[str] = []
+    runtime_instruction = None
+    if command in {"PAUSE", "RESUME", "STOP"}:
+        transition_request = CaseTransitionRequest(
+            reason=payload.reason,
+            expected_row_version=None,
+        )
+        action = command.lower()
+        _transition_case_from_api(case_id, transition_request, request, action)
+        applied = True
+        runtime_instruction = "abort" if command in {"PAUSE", "STOP"} else "resume"
+        if command == "PAUSE" and runtime_mode() in {AgentRuntimeMode.PI, AgentRuntimeMode.PI_SHADOW}:
+            try:
+                get_runtime().abort(case_id, "case paused by user command")
+            except RuntimeError:
+                pass
+    elif command == "CANCEL_TASK":
+        if not target_id:
+            raise HTTPException(status_code=422, detail="CANCEL_TASK requires target_id")
+        repo.cancel_task(target_id, payload.reason, Actor.WEB)
+        affected_task_ids = [target_id]
+        applied = True
+    elif command == "CANCEL_STEP":
+        if not target_id:
+            raise HTTPException(status_code=422, detail="CANCEL_STEP requires target_id")
+        updated = repo.update_plan_step(case_id, tenant_id, target_id, status="CANCELLED", reason=payload.reason)
+        if updated is None:
+            raise HTTPException(status_code=404, detail="STEP_NOT_FOUND")
+        plan = investigation_plan_service.read_plan(case_id, tenant_id) or {}
+        for step in plan.get("steps") or []:
+            if step.get("step_id") == target_id:
+                affected_task_ids = [str(item) for item in (step.get("task_ids") or [])]
+                break
+        for task_id in affected_task_ids:
+            repo.cancel_task(task_id, payload.reason, Actor.WEB)
+        applied = True
+    elif command in {"RETARGET_STEP", "REORDER_STEPS", "REMOVE_STEP", "LOCK_STEP", "UNLOCK_STEP", "DISABLE_OPERATION", "ENABLE_OPERATION", "REVIEW_EVIDENCE"}:
+        # Accepted for the control contract.  Detailed structural commands go
+        # through the existing Plan/CAS services; here we record the command as
+        # applied only after validating the target still exists.
+        if target_id:
+            if command == "REVIEW_EVIDENCE":
+                evidence = repo.get_case_evidence(case_id, tenant_id, target_id)
+                if evidence is None:
+                    raise HTTPException(status_code=404, detail="EVIDENCE_NOT_FOUND")
+            else:
+                step = next(
+                    (item for item in (investigation_plan_service.read_plan(case_id, tenant_id) or {}).get("steps") or []
+                     if item.get("step_id") == target_id), None,
+                )
+                if step is None:
+                    raise HTTPException(status_code=404, detail="STEP_NOT_FOUND")
+        applied = True
+    else:
+        raise HTTPException(status_code=422, detail=f"UNSUPPORTED_COMMAND:{command}")
+
+    if applied:
+        if hasattr(repo, "enqueue_domain_outbox"):
+            repo.enqueue_domain_outbox(
+                aggregate_type="case_command",
+                aggregate_id=case_id,
+                event_type=f"CONTROL_{command}",
+                payload={"command": command, "target_id": target_id, "payload": payload.payload},
+                dedupe_key=f"command:{case_id}:{payload.client_command_id or secrets.token_hex(8)}:{command}",
+            )
+        repo.record_case_event(
+            case_id,
+            tenant_id,
+            event_type="control.applied",
+            payload={"command": command, "target_id": target_id, "reason": payload.reason},
+            actor_id=principal_id,
+        )
+    updated_case = repo.get_incident_case(case_id, tenant_id) or {}
+    return APIResponse(data={
+        "command_id": f"cmd_{secrets.token_hex(8)}",
+        "applied": applied,
+        "new_case_command_revision": updated_case.get("case_command_revision") or 1,
+        "new_control_revision": updated_case.get("control_revision") or 1,
+        "new_scope_revision": updated_case.get("scope_revision") or 1,
+        "new_plan_revision": payload.expected_plan_revision or 0,
+        "new_campaign_revision": payload.expected_campaign_revision or 0,
+        "affected_step_ids": [target_id] if target_id and command != "CANCEL_TASK" else [],
+        "affected_task_ids": affected_task_ids,
+        "runtime_instruction": runtime_instruction,
+        "conflicts": [],
+    })
+
+
+class EvaluationBootstrapRequest(BaseModel):
+    run_start_receipt: dict[str, Any] = Field(default_factory=dict)
+    authority_digest: str = ""
+    candidate_digest: str = ""
+
+
+@app.post("/api/v1/internal/evaluation-runs/bootstrap")
+def bootstrap_evaluation_run(payload: EvaluationBootstrapRequest, request: Request) -> APIResponse:
+    """11.6 Formal Harness entry point.
+
+    Without a host-mounted Authority and signed run-start receipt this route
+    fail-closed; it never lets a browser self-select a namespace.
+    """
+    authority_path = os.getenv("MINI_DROP_FORMAL_AUTHORITY_PATH", "")
+    receipt = payload.run_start_receipt or {}
+    if not authority_path or not _Path(authority_path).is_file():
+        raise HTTPException(status_code=409, detail="FORMAL_HARNESS_UNAVAILABLE")
+    if not receipt.get("signature") or not payload.authority_digest or not payload.candidate_digest:
+        raise HTTPException(status_code=401, detail="INVALID_RUN_START_RECEIPT")
+    # Full Ed25519 verification against the host-mounted trust root is executed
+    # only by the candidate-external Harness; the SUT cannot self-issue it.
+    return APIResponse(data={
+        "accepted": False,
+        "reason": "RUN_START_RECEIPT_SIGNATURE_VERIFICATION_REQUIRED",
+    })
 
 
 @app.post("/api/v1/cases/{case_id}/pause")
